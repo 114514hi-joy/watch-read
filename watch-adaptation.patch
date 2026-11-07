@@ -1,0 +1,2999 @@
+diff --git a/README.md b/README.md
+index 8964464..f5fa392 100644
+--- a/README.md
++++ b/README.md
+@@ -19,6 +19,44 @@
+ > [!WARNING]
+ > 仅供学习研究，不提供、不存放任何内容。内容来自第三方公开接口，版权归原作者所有。使用后果自负，如有侵权请联系删除。
+ 
++---
++
++## 手表端适配分支（本仓库）
++
++本仓库是上游 [ch6vip/fqapp](https://github.com/ch6vip/fqapp) 在提交 `4c7bc6d` 基础上的**二次修改**，不是官方版本。原作者为 ch6vip，许可证 GPL-3.0（见 [LICENSE](LICENSE)）。关于页的赞赏渠道、源代码与问题反馈入口均归原作者，未做替换。
++
++适配与优化：寒彻歌未竟 · 手表端相关问题：<3585001644@qq.com>
++
++### 改动摘要
++
++- **后台听书**：前台服务新增 `PARTIAL_WAKE_LOCK` / `WifiLock`（章末换集留宽限期）；息屏后由原生 completion 直接换集，跳过 Dart 侧 3 秒倒计时；后台位置上报 200ms → 1s，落盘与通知刷新 5s → 30s，跳过字幕/跟随高亮发布
++- **高倍速提示**：窄屏下倍速 > 2.0× 时提示可能卡顿（手表实测 3.0× 掉帧、2.0× 流畅），保留 3.0× 不硬限制
++- **窄屏适配**：紧凑底栏、搜索输入接管、手表密度下的布局调整
++- **关于页**：打赏归属声明、适配署名、独立的适配反馈入口
++
++逐文件改动见本提交的 diff（`git show --stat HEAD`）。
++
++### 构建
++
++```bash
++flutter pub get
++flutter build apk --release --target-platform android-arm --split-per-abi
++```
++
++产物为 `build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk`（armeabi-v7a，32 位 ARM）。
++签名私钥不在仓库内（`android/.gitignore` 已排除 `**/*.jks`），请自备 keystore 并通过环境变量配置。
++
++### 适用范围与已知限制
++
++- 实测：OPPO Watch OWW211 / Android 11；其它机型未测
++- 3.0× 在这块表上会明显掉帧，建议不超过 2.0×
++- 息屏长时间连播建议在系统设置里给应用加电池白名单
++- 从最近任务划掉会停止播放
++
++App 不提供任何内容源，账号与书源由使用者自行配置；仅供个人学习研究，请遵守相关法律法规。
++
++---
++
+ ## 能做什么
+ 
+ - **📖 看小说** —— 左右翻页或上下滑动，字号字体随意调，有段落评论
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index dbb2209..aebb552 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -5,6 +5,8 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
++    <!-- 息屏后台听书：前台服务只提优先级，挡不住 CPU 休眠；必须另持 PARTIAL_WAKE_LOCK -->
++    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+     <!-- 短剧 / 漫剧悬浮窗播放（#24）：切后台时把画面搬进系统悬浮窗，需要用户在系统设置里允许 -->
+     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+     <!-- Device identity and reading data stay on-device; see
+diff --git a/android/app/src/main/kotlin/com/fqapp/fqapp/ListenKeepAliveService.kt b/android/app/src/main/kotlin/com/fqapp/fqapp/ListenKeepAliveService.kt
+index dbbb891..3a4775d 100644
+--- a/android/app/src/main/kotlin/com/fqapp/fqapp/ListenKeepAliveService.kt
++++ b/android/app/src/main/kotlin/com/fqapp/fqapp/ListenKeepAliveService.kt
+@@ -10,10 +10,12 @@ import android.content.Intent
+ import android.content.pm.ServiceInfo
+ import android.graphics.Bitmap
+ import android.graphics.BitmapFactory
++import android.net.wifi.WifiManager
+ import android.os.Build
+ import android.os.Handler
+ import android.os.IBinder
+ import android.os.Looper
++import android.os.PowerManager
+ import android.support.v4.media.MediaMetadataCompat
+ import android.support.v4.media.session.MediaSessionCompat
+ import android.support.v4.media.session.PlaybackStateCompat
+@@ -70,6 +72,16 @@ class ListenKeepAliveService : Service() {
+     private var durationMs: Long = 0L
+     private var speed: Float = 1f
+ 
++    // 前台服务只提高进程优先级，不阻止 CPU / Wi-Fi 休眠。手表息屏后 Dart
++    // isolate 会被挂起，原生 STATE_ENDED 事件与「下一集」定时器都推不动，
++    // 亮屏才补跑。播放期间（含换集间隙）必须自己持锁。
++    private var wakeLock: PowerManager.WakeLock? = null
++    private var wifiLock: WifiManager.WifiLock? = null
++    private val serviceHandler = Handler(Looper.getMainLooper())
++    private var releaseLocksRunnable: Runnable? = null
++    private var foregroundStarted = false
++    private var lastPayloadSignature: String? = null
++
+     override fun onBind(intent: Intent?): IBinder? = null
+ 
+     override fun onCreate() {
+@@ -92,6 +104,7 @@ class ListenKeepAliveService : Service() {
+             .cancel(NOTIFICATION_ID)
+         mediaSession?.release()
+         mediaSession = null
++        releaseLocks()
+         coverLoader.shutdownNow()
+         super.onDestroy()
+     }
+@@ -114,6 +127,74 @@ class ListenKeepAliveService : Service() {
+         }
+     }
+ 
++    /**
++     * 持有 PARTIAL_WAKE_LOCK + WifiLock。播放中每次 onStartCommand 都会续上；
++     * 章末 Dart 上报 playing=false 时不立刻释放，留 [WAKE_LOCK_GRACE_MS] 窗口
++     * 给「播完 → 拉下一集流 → 起播」，否则正好卡在换集这一步。
++     */
++    @Suppress("DEPRECATION")
++    private fun acquireLocks() {
++        releaseLocksRunnable?.let {
++            serviceHandler.removeCallbacks(it)
++            releaseLocksRunnable = null
++        }
++        try {
++            if (wakeLock == null) {
++                val manager = getSystemService(Context.POWER_SERVICE) as PowerManager
++                wakeLock = manager.newWakeLock(
++                    PowerManager.PARTIAL_WAKE_LOCK,
++                    "fqapp:listen-playback"
++                ).apply { setReferenceCounted(false) }
++            }
++            // 不判断 isHeld：OPPO/ColorOS 的后台省电管控会在不通知客户端的
++            // 情况下把锁撤销，此时客户端 isHeld() 仍是 true，判断后就永远不再
++            // 申请（实测手表上锁被撤后再没回来）。非引用计数锁重复 acquire
++            // 是安全的，每次 playing=true 都向 PowerManagerService 重申一次。
++            wakeLock?.acquire()
++
++            if (wifiLock == null) {
++                // 用 applicationContext：WifiLock 会持住系统服务，别挂在可能被
++                // 销毁的 Service 上下文上。
++                val manager = applicationContext
++                    .getSystemService(Context.WIFI_SERVICE) as WifiManager
++                wifiLock = manager.createWifiLock(
++                    WifiManager.WIFI_MODE_FULL,
++                    "fqapp:listen-playback"
++                ).apply { setReferenceCounted(false) }
++            }
++            // 同上：WifiLock 也可能被系统单方面撤掉。
++            wifiLock?.acquire()
++        } catch (error: Throwable) {
++            Log.w(TAG, "listen wake lock unavailable", error)
++        }
++    }
++
++    private fun releaseLocks() {
++        releaseLocksRunnable?.let {
++            serviceHandler.removeCallbacks(it)
++            releaseLocksRunnable = null
++        }
++        try {
++            if (wakeLock?.isHeld == true) wakeLock?.release()
++            if (wifiLock?.isHeld == true) wifiLock?.release()
++        } catch (error: Throwable) {
++            Log.w(TAG, "listen wake lock release failed", error)
++        }
++    }
++
++    /** 暂停后延迟释放：给换集间隙留窗口，也避免用户真暂停后一直耗电。 */
++    private fun scheduleReleaseLocks() {
++        if (wakeLock?.isHeld != true && wifiLock?.isHeld != true) return
++        // Dart 暂停期间仍会定时回传状态；已排过就别反复续期，否则锁永远不释放。
++        if (releaseLocksRunnable != null) return
++        val pending = Runnable {
++            releaseLocksRunnable = null
++            if (!isPlaying) releaseLocks()
++        }
++        releaseLocksRunnable = pending
++        serviceHandler.postDelayed(pending, WAKE_LOCK_GRACE_MS)
++    }
++
+     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+         val action = intent?.action
+         if (action != null) {
+@@ -135,6 +216,7 @@ class ListenKeepAliveService : Service() {
+ 
+                 ACTION_STOP -> {
+                     NativePlayerPlugin.dispatchNotificationAction(ACTION_NAME_STOP)
++                    releaseLocks()
+                     stopSelf()
+                     return START_NOT_STICKY
+                 }
+@@ -164,6 +246,21 @@ class ListenKeepAliveService : Service() {
+         durationMs = duration
+         speed = rate
+ 
++        // 播放中持锁；章末 Dart 上报 playing=false 时留宽限期，避免换集间隙
++        // CPU 睡过去、「下一集」停在半路。
++        if (playing) acquireLocks() else scheduleReleaseLocks()
++
++        // 位置按 2 秒分桶：Dart 定时回真实位置纠正系统外推，内容没变时反复
++        // 重建 4 个 PendingIntent + MediaStyle + MediaSession，在手表主线程上
++        // 是纯浪费。首次仍必须老老实实 startForeground。
++        val signature = listOf(
++            title, episode, coverUrl, playing, prev, next, duration, rate, position / 2000L
++        ).joinToString("|")
++        if (foregroundStarted && signature == lastPayloadSignature) {
++            return START_NOT_STICKY
++        }
++        lastPayloadSignature = signature
++
+         val notification = buildNotification(title, episode, isPlaying, hasPrev, hasNext)
+         syncPlaybackState(isPlaying, positionMs, durationMs, speed)
+         // 封面是异步的：当前这一张还在路上时先用应用图标顶上，取到之后再刷一遍
+@@ -180,6 +277,7 @@ class ListenKeepAliveService : Service() {
+         } else {
+             startForeground(NOTIFICATION_ID, notification)
+         }
++        foregroundStarted = true
+         return START_NOT_STICKY
+     }
+ 
+@@ -459,6 +557,13 @@ class ListenKeepAliveService : Service() {
+         /** 封面下载的建连 / 读超时：后台服务里不能挂住太久。 */
+         private const val COVER_TIMEOUT_MS = 8_000
+ 
++        /**
++         * playing=false 之后保留唤醒锁的宽限期。章末到下一集起播之间要拉流、
++         * 解密、prepare，手表上慢的时候十几秒也正常；给足 90 秒，用户真暂停
++         * 也不会一直耗电。
++         */
++        private const val WAKE_LOCK_GRACE_MS = 90_000L
++
+         /** Dart 侧 `_handleRemoteAction` 认识的动作名；通知按钮与媒体会话共用一份。 */
+         private const val ACTION_NAME_PLAY_PAUSE = "playPause"
+         private const val ACTION_NAME_PREV = "prev"
+diff --git a/android/app/src/main/kotlin/com/fqapp/fqapp/MainActivity.kt b/android/app/src/main/kotlin/com/fqapp/fqapp/MainActivity.kt
+index 74765d0..dee76a4 100644
+--- a/android/app/src/main/kotlin/com/fqapp/fqapp/MainActivity.kt
++++ b/android/app/src/main/kotlin/com/fqapp/fqapp/MainActivity.kt
+@@ -1,10 +1,15 @@
+ package com.fqapp.fqapp
+ 
++import android.content.Context
++import android.content.res.Configuration
++import android.util.Log
+ import android.view.KeyEvent
+ import io.flutter.embedding.android.FlutterActivity
++import io.flutter.embedding.android.RenderMode
+ import io.flutter.embedding.engine.FlutterEngine
+ import io.flutter.embedding.engine.FlutterShellArgs
+ import io.flutter.plugin.common.MethodChannel
++import kotlin.math.roundToInt
+ 
+ class MainActivity : FlutterActivity() {
+     // 音量键翻页桥。Dart 侧在阅读页且开启“音量键翻页”时通过 setEnabled(true)
+@@ -14,6 +19,71 @@ class MainActivity : FlutterActivity() {
+     private var volumeKeyEnabled = false
+     private var volumeChannel: MethodChannel? = null
+ 
++    /**
++     * 原生文本输入浮层。窄屏（手表）上 Flutter 自己的 TextField 调不出系统
++     * 输入法，改由它承载输入，见 [WatchInputOverlay] 的类注释。
++     */
++    private var watchInput: WatchInputOverlay? = null
++
++    /**
++     * 目标逻辑宽度（dp）。只有比它更**窄**的设备才会被放大画布。
++     *
++     * 表盘（OPPO Watch 3 Pro）是 378×496px、密度 2.0，逻辑画布只有
++     * 189×248dp，而整套界面是按 360dp 排版的，不缩放必然溢出。把密度按
++     * 目标宽度重算后画布变成 320×420dp，界面等比缩到 59%。
++     *
++     * Flutter 的 devicePixelRatio 直接取 Resources 的 DisplayMetrics.density
++     * （FlutterView#getDevicePixelRatio），所以 attachBaseContext 里换掉
++     * Configuration 的 densityDpi，引擎、布局、手势坐标、系统 inset 会一起
++     * 等比缩放；manifest 的 configChanges 已含 density，不会重建 Activity。
++     * 手机（≥320dp）走原逻辑，行为不变。
++     */
++    private val targetWidthDp = 320f
++
++    override fun attachBaseContext(newBase: Context) {
++        val metrics = newBase.resources.displayMetrics
++        val density = metrics.density
++        // 拿不到有效尺寸就原样挂载，缩放是增强而不是前置条件。
++        if (density <= 0f || metrics.widthPixels <= 0) {
++            Log.i("FqDensity", "skip: metrics unavailable")
++            super.attachBaseContext(newBase)
++            return
++        }
++        val currentWidthDp = metrics.widthPixels / density
++        // 比目标更宽（手机）不缩：这里只解决「画布太窄装不下」。
++        // 判断方向不能反：手表是 189dp < 320dp，正是要放大画布的那一侧。
++        if (currentWidthDp >= targetWidthDp) {
++            Log.i(
++                "FqDensity",
++                "skip: widthDp=${currentWidthDp.roundToInt()} >= target=${targetWidthDp.roundToInt()}dp",
++            )
++            super.attachBaseContext(newBase)
++            return
++        }
++        val config = Configuration(newBase.resources.configuration)
++        val originalDpi = config.densityDpi
++        config.densityDpi = (originalDpi * currentWidthDp / targetWidthDp).roundToInt()
++        Log.i(
++            "FqDensity",
++            "widthPx=${metrics.widthPixels} widthDp=${currentWidthDp.roundToInt()} " +
++                "dpi=$originalDpi -> ${config.densityDpi} target=${targetWidthDp.roundToInt()}dp",
++        )
++        super.attachBaseContext(newBase.createConfigurationContext(config))
++    }
++
++    /**
++     * 渲染模式固定为 SurfaceView（引擎默认）。
++     *
++     * 曾经试过 RenderMode.texture，想绕开这台表上「输入法窗口卡在
++     * mDrawState=READY_TO_SHOW / shown=false、永远不出首帧」的问题，
++     * 实测无效：切成 TextureView 后窗口状态一模一样，屏幕上仍然没有键盘。
++     * 所以那条路证伪，保留 SurfaceView（纹理模式多一次 GPU 拷贝，白搭）。
++     *
++     * 输入法问题的排查记录见 docs/watch-watch3pro-notes.md：原生 EditText
++     * （系统浏览器、番茄小说）都正常，只有 FlutterView 触发。
++     */
++    override fun getRenderMode(): RenderMode = RenderMode.surface
++
+     override fun getFlutterShellArgs(): FlutterShellArgs = super.getFlutterShellArgs().also {
+         // Runs before the engine/FlutterLoader starts; configureFlutterEngine is
+         // too late to select the process-wide rendering backend.
+@@ -42,6 +112,28 @@ class MainActivity : FlutterActivity() {
+         // 小米澎湃 OS 公平运行内存：收 TRIM/KILL 广播，转发 Dart 处理后回系统。
+         flutterEngine.plugins.add(FairMemoryPlugin())
+ 
++        // 原生文本输入通道：Dart 在窄屏上放弃 Flutter 的 TextField，改调这里
++        // 弹出的原生 EditText 浮层（系统输入法只认原生控件）。
++        val input = WatchInputOverlay(this)
++        watchInput = input
++        MethodChannel(
++            flutterEngine.dartExecutor.binaryMessenger,
++            WatchInputOverlay.CHANNEL,
++        ).setMethodCallHandler { call, result ->
++            when (call.method) {
++                "open" -> input.show(
++                    call.argument<String>("initial").orEmpty(),
++                    call.argument<String>("hint").orEmpty(),
++                    result,
++                )
++                "close" -> {
++                    input.finish(null)
++                    result.success(null)
++                }
++                else -> result.notImplemented()
++            }
++        }
++
+         // 音量键翻页通道：Dart -> 原生 setEnabled 控制是否拦截；原生 -> Dart
+         // volumeKey 回调翻页方向（+1 下一页 / -1 上一页）。
+         volumeChannel = MethodChannel(
+@@ -60,6 +152,20 @@ class MainActivity : FlutterActivity() {
+         }
+     }
+ 
++    /** 原生输入浮层打开时，返回键先关浮层，不要退出页面。 */
++    @Deprecated("FlutterActivity 仍走 Activity#onBackPressed；浮层需要优先消费它")
++    override fun onBackPressed() {
++        if (watchInput?.handleBack() == true) return
++        @Suppress("DEPRECATION")
++        super.onBackPressed()
++    }
++
++    override fun onDestroy() {
++        watchInput?.dispose()
++        watchInput = null
++        super.onDestroy()
++    }
++
+     override fun dispatchKeyEvent(event: KeyEvent?): Boolean {
+         if (volumeKeyEnabled && event != null) {
+             val key = event.keyCode
+diff --git a/android/app/src/main/kotlin/com/fqapp/fqapp/NativePlayerPlugin.kt b/android/app/src/main/kotlin/com/fqapp/fqapp/NativePlayerPlugin.kt
+index 841f090..dfc135e 100644
+--- a/android/app/src/main/kotlin/com/fqapp/fqapp/NativePlayerPlugin.kt
++++ b/android/app/src/main/kotlin/com/fqapp/fqapp/NativePlayerPlugin.kt
+@@ -179,6 +179,13 @@ class NativePlayerPlugin internal constructor(
+     private var activity: Activity? = null
+     private var activityBinding: ActivityPluginBinding? = null
+     private var notificationPermissionRequested = false
++
++    /**
++     * 息屏 / 切后台时把位置上报从 200ms 降到 1s。手表上 5Hz 的
++     * JNI → EventChannel → Dart → ValueListenableBuilder 链路是持续负载，
++     * 而后台没有界面需要按帧刷新进度。
++     */
++    @Volatile private var playbackInBackground = false
+     private val players = ConcurrentHashMap<Int, PlayerInstance>()
+     private val pendingPlayerIds = ConcurrentHashMap.newKeySet<Int>()
+     private val nextId = AtomicInteger(1)
+@@ -572,6 +579,11 @@ class NativePlayerPlugin internal constructor(
+                 result.success(null)
+             }
+ 
++            "setBackgroundMode" -> {
++                playbackInBackground = call.argument<Boolean>("background") == true
++                result.success(null)
++            }
++
+             "startListenForeground" -> {
+                 val context = activity ?: flutterBinding.applicationContext
+                 requestNotificationPermissionIfNeeded()
+@@ -1050,7 +1062,10 @@ class NativePlayerPlugin internal constructor(
+                         reportedDurationMs = durationMs
+                         sendEvent(playerId, "duration", durationMs)
+                     }
+-                    handler.postDelayed(this, 200)
++                    handler.postDelayed(
++                        this,
++                        if (playbackInBackground) 1000L else 200L
++                    )
+                 } else {
+                     current.positionUpdater = null
+                 }
+diff --git a/android/app/src/main/kotlin/com/fqapp/fqapp/WatchInputOverlay.kt b/android/app/src/main/kotlin/com/fqapp/fqapp/WatchInputOverlay.kt
+new file mode 100644
+index 0000000..6b94a54
+--- /dev/null
++++ b/android/app/src/main/kotlin/com/fqapp/fqapp/WatchInputOverlay.kt
+@@ -0,0 +1,180 @@
++package com.fqapp.fqapp
++
++import android.app.Activity
++import android.graphics.Color
++import android.graphics.drawable.GradientDrawable
++import android.text.InputType
++import android.util.TypedValue
++import android.view.Gravity
++import android.view.ViewGroup
++import android.view.inputmethod.EditorInfo
++import android.view.inputmethod.InputMethodManager
++import android.widget.EditText
++import android.widget.FrameLayout
++import android.widget.LinearLayout
++import android.widget.TextView
++import io.flutter.plugin.common.MethodChannel
++
++/**
++ * 全屏原生文本输入浮层。
++ *
++ * 为什么不用 Flutter 的 TextField：这台表（OPPO Watch 3 Pro / ColorOS Watch 5）
++ * 上，FlutterView 申请输入法后系统始终不显示键盘——IME 窗口建好了、
++ * `mInputShown=true`，但 `mDrawState` 卡在 READY_TO_SHOW、shown=false，永远不出
++ * 首帧（排查记录见 docs 里的会话笔记）。原生 EditText 不受影响：同一套搜狗
++ * 输入法在系统浏览器、番茄小说里都能正常弹出。
++ *
++ * 所以这里把输入交给一个真正的 EditText：焦点、输入连接、输入法全走系统原生
++ * 路径；`showSoftInput(..., SHOW_FORCED)` 是必需的，普通请求在这台表上会被忽略。
++ *
++ * 布局上有一条硬约束：**按钮必须和输入框在同一行**。搜狗手表输入法是全屏形态，
++ * 一弹出系统就会把窗口内容整体上推、只留输入框所在的那一条可见；放在输入框
++ * 上方或下方的控件都会被推到屏幕外，用户根本按不到（实测过）。
++ */
++class WatchInputOverlay(private val activity: Activity) {
++
++    private var overlay: ViewGroup? = null
++    private var edit: EditText? = null
++    private var pending: MethodChannel.Result? = null
++
++    private val density: Float
++        get() = activity.resources.displayMetrics.density
++
++    private fun dp(value: Int): Int = (value * density).toInt()
++
++    val isShowing: Boolean
++        get() = overlay != null
++
++    fun show(initialText: String, hintText: String, result: MethodChannel.Result) {
++        if (overlay != null) {
++            result.error("busy", "原生输入浮层已经打开", null)
++            return
++        }
++        pending = result
++
++        val root = activity.findViewById<ViewGroup>(android.R.id.content)
++        val container = FrameLayout(activity).apply {
++            setBackgroundColor(0xF2000000.toInt())
++            isClickable = true
++        }
++
++        val column = LinearLayout(activity).apply {
++            orientation = LinearLayout.VERTICAL
++            setPadding(dp(10), dp(8), dp(10), dp(8))
++        }
++
++        val field = EditText(activity).apply {
++            setText(initialText)
++            setSelection(text.length)
++            setHint(if (hintText.isEmpty()) null else hintText)
++            setTextColor(Color.WHITE)
++            setHintTextColor(0xFF8E8A85.toInt())
++            setTextSize(TypedValue.COMPLEX_UNIT_SP, 16f)
++            inputType = InputType.TYPE_CLASS_TEXT
++            imeOptions = EditorInfo.IME_ACTION_DONE
++            isSingleLine = true
++            setPadding(dp(10), dp(8), dp(10), dp(8))
++            background = GradientDrawable().apply {
++                cornerRadius = dp(9).toFloat()
++                setColor(0xFF2C2C2C.toInt())
++                setStroke(dp(1), 0xFF3C3C3C.toInt())
++            }
++        }
++
++        // 一行搞定：输入框 + 取消 + 确定，三者同生共死（见类注释）。
++        val row = LinearLayout(activity).apply {
++            orientation = LinearLayout.HORIZONTAL
++            gravity = Gravity.CENTER_VERTICAL
++        }
++        row.addView(field, LinearLayout.LayoutParams(
++            0,
++            ViewGroup.LayoutParams.WRAP_CONTENT,
++            1f,
++        ))
++        row.addView(button("取消", primary = false) { finish(null) })
++        row.addView(button("确定", primary = true) { finish(field.text?.toString().orEmpty()) })
++
++        column.addView(row, LinearLayout.LayoutParams(
++            ViewGroup.LayoutParams.MATCH_PARENT,
++            ViewGroup.LayoutParams.WRAP_CONTENT,
++        ))
++
++        container.addView(column, FrameLayout.LayoutParams(
++            ViewGroup.LayoutParams.MATCH_PARENT,
++            ViewGroup.LayoutParams.WRAP_CONTENT,
++            Gravity.TOP,
++        ))
++
++        // 输入法动作栏的「完成」等价于点确定，省得在小屏上来回移动手指。
++        field.setOnEditorActionListener { _, actionId, _ ->
++            if (actionId == EditorInfo.IME_ACTION_DONE ||
++                actionId == EditorInfo.IME_ACTION_SEARCH ||
++                actionId == EditorInfo.IME_ACTION_GO
++            ) {
++                finish(field.text?.toString().orEmpty())
++                true
++            } else {
++                false
++            }
++        }
++
++        overlay = container
++        edit = field
++        root.addView(container, FrameLayout.LayoutParams(
++            ViewGroup.LayoutParams.MATCH_PARENT,
++            ViewGroup.LayoutParams.MATCH_PARENT,
++        ))
++
++        field.post {
++            field.requestFocus()
++            val imm = activity.getSystemService(InputMethodManager::class.java)
++            // SHOW_FORCED 是必需的：这台表忽略普通 showSoftInput 请求。
++            imm?.showSoftInput(field, InputMethodManager.SHOW_FORCED)
++        }
++    }
++
++    private fun button(label: String, primary: Boolean, onClick: () -> Unit): TextView =
++        TextView(activity).apply {
++            text = label
++            gravity = Gravity.CENTER
++            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
++            setTextColor(if (primary) Color.WHITE else 0xFFB7B7B7.toInt())
++            setPadding(dp(10), dp(8), dp(10), dp(8))
++            background = GradientDrawable().apply {
++                cornerRadius = dp(9).toFloat()
++                setColor(if (primary) 0xFFEF5038.toInt() else 0x00000000)
++            }
++            setOnClickListener { onClick() }
++        }
++
++    /** 关闭浮层并回传文本；[text] 为 null 表示用户取消。 */
++    fun finish(text: String?) {
++        val result = pending
++        pending = null
++        val imm = activity.getSystemService(InputMethodManager::class.java)
++        edit?.let { imm?.hideSoftInputFromWindow(it.windowToken, 0) }
++        (overlay?.parent as? ViewGroup)?.removeView(overlay)
++        overlay = null
++        edit = null
++        result?.success(text)
++    }
++
++    /** Activity 销毁时兜底，避免 Result 悬空。 */
++    fun dispose() {
++        pending = null
++        (overlay?.parent as? ViewGroup)?.removeView(overlay)
++        overlay = null
++        edit = null
++    }
++
++    /** 给返回键用：浮层打开时先关浮层。 */
++    fun handleBack(): Boolean {
++        if (overlay == null) return false
++        finish(null)
++        return true
++    }
++
++    companion object {
++        const val CHANNEL = "fqapp/native_input"
++    }
++}
+diff --git a/android/gradle.properties b/android/gradle.properties
+index 8efd2e6..06e8bc0 100644
+--- a/android/gradle.properties
++++ b/android/gradle.properties
+@@ -12,3 +12,7 @@ kotlin.compiler.execution.strategy=in-process
+ # its default platform list. The Go JNI backend is arm64-only, so preserve the
+ # explicit arm64-v8a filter declared in app/build.gradle.kts.
+ disable-abi-filtering=true
++
++# 本地构建：关掉 Gradle 内置的 SDK 自动安装。它在弱网下会静默挂住，
++# 缺少的包改用 cmdline-tools 的 sdkmanager 手动装（会直接报错而非卡死）。
++android.builder.sdkDownload=false
+diff --git a/lib/main.dart b/lib/main.dart
+index 30262af..f921ea9 100644
+--- a/lib/main.dart
++++ b/lib/main.dart
+@@ -48,9 +48,27 @@ import 'services/swipe_guide_store.dart';
+ import 'services/third_party_licenses.dart';
+ import 'widgets/lazy_indexed_stack.dart';
+ import 'widgets/shell_dock.dart';
++import 'widgets/compact_shell_dock.dart';
+ import 'widgets/unsupported_feature_page.dart';
+ import 'widgets/home/home_design.dart';
+ 
++/// 听书后台降频：全局只注册一次，避免每条播放链路各自维护前后台状态，
++/// 也避免会话关闭后原生标志卡在「后台」不恢复。
++final _PlaybackLifecycleObserver _playbackLifecycleObserver =
++    _PlaybackLifecycleObserver();
++
++class _PlaybackLifecycleObserver with WidgetsBindingObserver {
++  bool _background = false;
++
++  @override
++  void didChangeAppLifecycleState(AppLifecycleState state) {
++    final background = state != AppLifecycleState.resumed;
++    if (background == _background) return;
++    _background = background;
++    unawaited(NativePlayer.setBackgroundMode(background));
++  }
++}
++
+ Future<void> main() async {
+   // 绑定初始化与 runApp 必须处在同一个 Zone：此前 `ensureInitialized` 在
+   // Zone 外、`runApp` 在 `runZonedGuarded` 里，Flutter 每次冷启动都会断言
+@@ -59,6 +77,7 @@ Future<void> main() async {
+   // 噪声里。因此整条启动流程收进同一个受保护的 Zone。
+   await runZonedGuarded(() async {
+     WidgetsFlutterBinding.ensureInitialized();
++    WidgetsBinding.instance.addObserver(_playbackLifecycleObserver);
+     // 装配失败不许挡住界面：记一条错误后照常 runApp，各页面自行退化。
+     try {
+       await _prepareRuntime();
+@@ -634,14 +653,24 @@ class _RootShellState extends State<RootShell> {
+           ],
+         ),
+       ),
+-      // 上游 Wenku8 GlassDock：胶囊、拖动预览和液态玻璃选中区；短剧视频流
+-      // 与 OLED 纯黑下改用同色静态底板，不对每帧变化的画面做实时折射。
+-      bottomNavigationBar: ShellDock(
+-        selectedIndex: _index,
+-        onSelected: _selectTab,
+-        overVideo: dramaOnVideo,
+-        staticMaterial: shellDockStaticMaterial(overVideo: dramaOnVideo),
+-      ),
++      // 窄屏（手表）：玻璃胶囊 dock 的 54dp + 12dp 底距在小画布上占比过高，
++      // 换成等分图标条。阈值见 [compactShellDockBreakpoint]，手机永远走原路。
++      bottomNavigationBar:
++          MediaQuery.sizeOf(context).width < compactShellDockBreakpoint
++          ? CompactShellDock(
++              selectedIndex: _index,
++              onSelected: _selectTab,
++              palette: palette,
++              overVideo: dramaOnVideo,
++            )
++          // 上游 Wenku8 GlassDock：胶囊、拖动预览和液态玻璃选中区；短剧视频流
++          // 与 OLED 纯黑下改用同色静态底板，不对每帧变化的画面做实时折射。
++          : ShellDock(
++              selectedIndex: _index,
++              onSelected: _selectTab,
++              overVideo: dramaOnVideo,
++              staticMaterial: shellDockStaticMaterial(overVideo: dramaOnVideo),
++            ),
+     );
+   }
+ }
+diff --git a/lib/pages/about_page.dart b/lib/pages/about_page.dart
+index dc5330c..4617d89 100644
+--- a/lib/pages/about_page.dart
++++ b/lib/pages/about_page.dart
+@@ -20,6 +20,10 @@ class AboutPage extends StatelessWidget {
+   /// build check when the two drift apart after a version bump.
+   static const versionText = '1.0.200 (205)';
+ 
++  /// 手表端适配者的反馈邮箱。与上方「问题反馈」（原作者 GitHub Issues）分开，
++  /// 免得适配相关的问题打扰上游项目。
++  static const adaptationFeedbackEmail = '3585001644@qq.com';
++
+   /// Bundled WeChat reward code (赞赏码), shown large in a dialog from the
+   /// support card. Copied from .github/wechat.png, the same image the repo's
+   /// FUNDING.yml points at.
+@@ -58,7 +62,9 @@ class AboutPage extends StatelessWidget {
+           const _AboutInfoCard(),
+           const SizedBox(height: 12),
+           const _SupportCard(),
+-          const SizedBox(height: 24),
++          const SizedBox(height: 16),
++          const _AdaptationCredit(),
++          const SizedBox(height: 16),
+           Center(
+             child: Text(
+               '仅限个人学习研究使用\n请遵守相关法律法规',
+@@ -80,6 +86,67 @@ class AboutPage extends StatelessWidget {
+     ).showSnackBar(const SnackBar(content: Text('已复制版本号')));
+   }
+ 
++  /// 手表适配反馈弹窗：只看邮箱就能联系，但要区分上游与适配两条反馈线。
++  /// 手表上常常没装邮件客户端，所以「复制邮箱」是主路径，「发邮件」是加分项。
++  static Future<void> _showAdaptationFeedback(BuildContext context) {
++    final palette = HomePalette.of(context);
++    return showDialog<void>(
++      context: context,
++      builder: (dialogContext) => AlertDialog(
++        title: const Text('手表适配反馈'),
++        content: Column(
++          mainAxisSize: MainAxisSize.min,
++          crossAxisAlignment: CrossAxisAlignment.start,
++          children: [
++            Text(
++              adaptationFeedbackEmail,
++              style: TextStyle(fontSize: 15, color: palette.ink),
++            ),
++            const SizedBox(height: 10),
++            Text(
++              '手表端适配相关问题发这个邮箱。\n'
++              '原项目本身的问题请走上方「问题反馈 → GitHub Issues」。',
++              style: TextStyle(
++                fontSize: 12.5,
++                color: palette.muted,
++                height: 1.5,
++              ),
++            ),
++          ],
++        ),
++        actions: [
++          TextButton(
++            onPressed: () {
++              unawaited(
++                Clipboard.setData(
++                  const ClipboardData(text: adaptationFeedbackEmail),
++                ),
++              );
++              Navigator.of(dialogContext).pop();
++              ScaffoldMessenger.of(context).showSnackBar(
++                const SnackBar(content: Text('已复制反馈邮箱')),
++              );
++            },
++            child: const Text('复制邮箱'),
++          ),
++          TextButton(
++            onPressed: () {
++              Navigator.of(dialogContext).pop();
++              unawaited(
++                _launchExternalUrl(
++                  context,
++                  'mailto:$adaptationFeedbackEmail'
++                  '?subject=${Uri.encodeComponent('什锦铺手表版反馈')}',
++                ),
++              );
++            },
++            child: const Text('发邮件'),
++          ),
++        ],
++      ),
++    );
++  }
++
+   /// 微信赞赏码弹窗：大图 + 一句扫码提示，点遮罩或「关闭」退出。
+   static Future<void> _showWechatReward(BuildContext context) {
+     final palette = HomePalette.of(context);
+@@ -103,7 +170,8 @@ class AboutPage extends StatelessWidget {
+               ),
+               const SizedBox(height: 12),
+               Text(
+-                '微信扫一扫，赞赏作者',
++                '微信扫一扫，赞赏原作者 ch6vip',
++                textAlign: TextAlign.center,
+                 style: TextStyle(fontSize: 14, color: palette.muted),
+               ),
+               Align(
+@@ -258,12 +326,19 @@ class _AboutInfoCard extends StatelessWidget {
+           icon: LucideIcons.message_square,
+           iconTile: true,
+           title: '问题反馈',
+-          subtitle: '前往 GitHub Issues 提交',
++          subtitle: '前往 GitHub Issues 提交（原作者）',
+           onTap: () => _launchExternalUrl(
+             context,
+             'https://github.com/ch6vip/fqapp/issues',
+           ),
+         ),
++        SettingsRow(
++          icon: LucideIcons.mail,
++          iconTile: true,
++          title: '手表适配反馈',
++          subtitle: '3585001644@qq.com',
++          onTap: () => AboutPage._showAdaptationFeedback(context),
++        ),
+       ],
+     );
+   }
+@@ -286,10 +361,13 @@ Future<void> _launchExternalUrl(BuildContext context, String url) async {
+   }
+ }
+ 
+-/// 支持作者区块：单独一张卡，用爱发电品牌紫着色并配实心按钮，比普通信息行
++/// 原作者赞赏区块：单独一张卡，用爱发电品牌紫着色并配实心按钮，比普通信息行
+ /// 更醒目（对齐 Aether 仓库赞助区的呈现方式）。点击只用系统浏览器打开链接，
+ /// 不引入账号、支付、捐赠校验或统计上报；墨水屏模式下退化为黑白。
+ /// 爱发电是主入口（实心按钮），微信赞赏是次级入口（描边按钮，点开弹窗看码）。
++///
++/// 链接与收款码都属上游原作者 ch6vip，不替换、不指向任何适配者渠道；
++/// 文案里明确写出归属，避免二次分发时被误读成适配者在募捐。
+ class _SupportCard extends StatelessWidget {
+   const _SupportCard();
+ 
+@@ -388,7 +466,7 @@ class _SupportHeader extends StatelessWidget {
+             crossAxisAlignment: CrossAxisAlignment.start,
+             children: [
+               Text(
+-                '支持作者',
++                '支持原作者',
+                 style: TextStyle(
+                   fontWeight: FontWeight.w600,
+                   fontSize: 15,
+@@ -397,8 +475,12 @@ class _SupportHeader extends StatelessWidget {
+               ),
+               const SizedBox(height: 2),
+               Text(
+-                '如果这个项目对你有帮助，欢迎在爱发电支持我',
+-                style: TextStyle(fontSize: 12.5, color: palette.muted),
++                '赞赏渠道归原作者 ch6vip 所有\n手表端适配者不收取任何费用',
++                style: TextStyle(
++                  fontSize: 12.5,
++                  color: palette.muted,
++                  height: 1.4,
++                ),
+               ),
+             ],
+           ),
+@@ -407,3 +489,26 @@ class _SupportHeader extends StatelessWidget {
+     );
+   }
+ }
++
++/// 二次分发的适配署名：注明改动者与被改动的上游版本，和上方原作者赞赏卡的
++/// 归属声明分开。放在打赏卡与底部免责声明之间，不打断信息卡里的菜单。
++class _AdaptationCredit extends StatelessWidget {
++  const _AdaptationCredit();
++
++  static const credit = '手表端适配与优化：寒彻歌未竟，基于 fqapp 1.0.200';
++
++  @override
++  Widget build(BuildContext context) {
++    return Center(
++      child: Text(
++        credit,
++        textAlign: TextAlign.center,
++        style: TextStyle(
++          fontSize: 12,
++          color: HomePalette.of(context).muted,
++          height: 1.5,
++        ),
++      ),
++    );
++  }
++}
+diff --git a/lib/pages/audio_page.dart b/lib/pages/audio_page.dart
+index 343e5b0..caed4f0 100644
+--- a/lib/pages/audio_page.dart
++++ b/lib/pages/audio_page.dart
+@@ -50,6 +50,7 @@ import '../widgets/audio/voice_settings_sheet.dart';
+ import '../widgets/reader/reader_listen_capsule.dart';
+ import '../widgets/chapter_cache_sheet.dart';
+ import '../widgets/comment_images.dart';
++import '../widgets/compact_shell_dock.dart' show compactShellDockBreakpoint;
+ import '../widgets/home/home_design.dart';
+ import '../widgets/home/home_sheet.dart';
+ import 'detail_page.dart';
+@@ -252,6 +253,13 @@ class _AudioPageState extends State<AudioPage> {
+   /// 「边听边读」打开原著阅读页的闸：目录请求期间重复点击不叠加路由。
+   bool _openingReadAlong = false;
+ 
++  /// 手表上超过这个倍速会明显掉帧：3.0× 的软件变速（atempo / Sonic）在
++  /// 小核上的开销是跳档的，实测 2.0× 流畅、3.0× 整机卡顿。
++  static const double _watchRateWarningThreshold = 2.0;
++
++  /// 高倍速的 SnackBar 一次听书会话只弹一次，滑条下方那行常驻提示不设限。
++  bool _rateWarningShown = false;
++
+   /// 展开态正文字号/行距来自阅读器排版设置；加载完成前用兜底 20sp / 2.1。
+   ReaderPreferences _readerPreferences = const ReaderPreferences();
+   bool _readerPreferencesLoaded = false;
+@@ -464,6 +472,9 @@ class _AudioPageState extends State<AudioPage> {
+   Future<void> _showRates() async {
+     final minRate = _AudioPlaybackController.minRate;
+     final maxRate = _AudioPlaybackController.maxRate;
++    // 只在手表/极窄屏上提醒：手机与桌面没有 3.0× 掉帧的问题。
++    final watch =
++        MediaQuery.sizeOf(context).width < compactShellDockBreakpoint;
+     // Slider 在 divisions 模式下会算出 0.6000000000000001 这种尾数，直接显示
+     // 会变成一串小数，统一按 0.1 取整后再显示与应用。
+     double snap(double value) => (value * 10).roundToDouble() / 10;
+@@ -509,6 +520,20 @@ class _AudioPageState extends State<AudioPage> {
+                     unawaited(c._setRate(next));
+                   },
+                 ),
++                // 拖动时随选值出现的一行小字：滑条是 0.1 步进，用 toast 会
++                // 连弹成串，而且手表屏窄会盖住滑条本身。
++                if (watch && draft > _watchRateWarningThreshold)
++                  Padding(
++                    padding: const EdgeInsets.symmetric(
++                      horizontal: 8,
++                      vertical: 2,
++                    ),
++                    child: Text(
++                      '超过 2.0× 在手表上可能卡顿',
++                      style: muted,
++                      textAlign: TextAlign.center,
++                    ),
++                  ),
+                 Padding(
+                   padding: const EdgeInsets.symmetric(horizontal: 8),
+                   child: Row(
+@@ -537,6 +562,17 @@ class _AudioPageState extends State<AudioPage> {
+         ),
+       ],
+     );
++    // 关掉面板时按最终值轻提醒一次；一次听书会话只弹一次，避免反复打开
++    // 速度面板时被打扰。滑条下方那行常驻提示不受这个闸限制。
++    if (!mounted || !watch || draft <= _watchRateWarningThreshold) return;
++    if (_rateWarningShown) return;
++    _rateWarningShown = true;
++    ScaffoldMessenger.of(context).showSnackBar(
++      const SnackBar(
++        content: Text('高倍速在手表上可能卡顿，建议不超过 2.0×'),
++        duration: Duration(seconds: 2),
++      ),
++    );
+   }
+ 
+   Future<void> _showVoices() async {
+diff --git a/lib/pages/search_page.dart b/lib/pages/search_page.dart
+index 2630871..e960a7a 100644
+--- a/lib/pages/search_page.dart
++++ b/lib/pages/search_page.dart
+@@ -13,6 +13,8 @@ import '../services/backend_transport.dart';
+ import '../services/desktop_platform.dart';
+ import '../services/search_history_store.dart';
+ import '../services/user_facing_error.dart';
++import '../services/native_text_input.dart';
++import '../widgets/compact_shell_dock.dart' show compactShellDockBreakpoint;
+ import '../widgets/search/search_discovery.dart';
+ import '../widgets/search/search_media_tile.dart';
+ import '../widgets/search/search_score_filter.dart';
+@@ -108,6 +110,9 @@ class _SearchPageState extends State<SearchPage> {
+   int _requestGeneration = 0;
+   double _minimumScore = 0;
+ 
++  /// 窄屏首次进入时是否已经自动弹过原生输入浮层（只弹一次）。
++  bool _autoOpenedNativeInput = false;
++
+   /// Upstream search results are always `NovelRow` lists; the cover grid is
+   /// an opt-in that fqapp persists.
+   bool _listView = true;
+@@ -300,6 +305,21 @@ class _SearchPageState extends State<SearchPage> {
+     );
+   }
+ 
++  /// 手表窄屏：把输入交给原生 EditText 浮层，回填后走同一套搜索流程。
++  Future<void> _openNativeInput() async {
++    final hint = _shuqiSource ? '搜索书旗书名或作者' : '搜索名称或作品 ID';
++    final text = await NativeTextInput.open(initial: _ctrl.text, hint: hint);
++    if (!mounted || text == null) return;
++    _ctrl.value = TextEditingValue(
++      text: text,
++      selection: TextSelection.collapsed(offset: text.length),
++    );
++    _onQueryChanged(text);
++    final trimmed = text.trim();
++    if (trimmed.isEmpty) return;
++    await _search(trimmed);
++  }
++
+   Future<void> _fetchSuggestions(String query, int generation) async {
+     final suggestions = await _suggestLoader(query);
+     // A late response must not overwrite a newer query's suggestions.
+@@ -645,6 +665,16 @@ class _SearchPageState extends State<SearchPage> {
+   @override
+   Widget build(BuildContext context) {
+     final feed = _feeds[_tabIndex];
++    // 手表窄屏：系统输入法在这个 Flutter 窗口里弹不出来（IME 窗口建好但永不出
++    // 首帧，见 NativeTextInput 注释），输入改走原生 EditText 浮层。
++    final watchInput =
++        MediaQuery.sizeOf(context).width < compactShellDockBreakpoint;
++    if (watchInput && widget.initialQuery == null && !_autoOpenedNativeInput) {
++      _autoOpenedNativeInput = true;
++      WidgetsBinding.instance.addPostFrameCallback((_) {
++        if (mounted) unawaited(_openNativeInput());
++      });
++    }
+     return Builder(
+       builder: (context) => WenkuPage(
+         extraHeight: _tabsHeight(context),
+@@ -723,6 +753,11 @@ class _SearchPageState extends State<SearchPage> {
+               clearTooltip: '清空',
+               onChanged: _onQueryChanged,
+               onSubmitted: _search,
++              // 窄屏下输入框只作展示，点击直接开原生浮层。
++              onTapOverride:
++                  MediaQuery.sizeOf(context).width < compactShellDockBreakpoint
++                  ? () => unawaited(_openNativeInput())
++                  : null,
+             ),
+           ),
+           SizedBox(
+diff --git a/lib/services/audio_playback_controller.dart b/lib/services/audio_playback_controller.dart
+index 965a536..d07f756 100644
+--- a/lib/services/audio_playback_controller.dart
++++ b/lib/services/audio_playback_controller.dart
+@@ -50,6 +50,11 @@ class _AudioPlaybackController extends ChangeNotifier
+   int _generation = 0;
+   int _seekGeneration = 0;
+   Timer? _saveTimer;
++  /// 后台把 5 秒的落盘 / 通知刷新降到 30 秒（每 6 个 tick 一次）。
++  int _backgroundSaveTicks = 0;
++  /// 前台服务通知上次的内容签名与刷新时刻：元数据没变时不必每 5 秒重建。
++  String? _foregroundSignature;
++  DateTime? _foregroundSyncedAt;
+   // 小米公平运行内存 KILL 广播的刷盘注销函数，见 reader_page.dart。
+   VoidCallback? _unregisterFairMemoryFlush;
+   bool _appActive = true;
+@@ -112,10 +117,17 @@ class _AudioPlaybackController extends ChangeNotifier
+   bool _sleepAtChapterEnd = false;
+ 
+   /// 连播倒计时的 3 秒窗口（官方 `te`「%s后播放下一集」）。
++  /// [_advanceTimer] 只刷 UI 上的「%s 后播放下一集」，真正换集由
++  /// [_advanceOneShot] 负责：倒计时被系统合并/节流时也不至于把换集一起拖住。
+   Timer? _advanceTimer;
++  Timer? _advanceOneShot;
+   int? _advanceRemaining;
+   final ValueNotifier<int?> _advanceCountdown = ValueNotifier<int?>(null);
+ 
++  /// 后台直接换集的起点下标。息屏时 Dart 定时器随时可能被冻结，回前台时
++  /// 若下标没动过（说明换集没成功），补一次重试。
++  int? _pendingAdvanceFrom;
++
+   /// 跳过片头/片尾（按书，打开章节时读入）。
+   AudioSkipPoints _skipPoints = AudioSkipPoints.none;
+ 
+@@ -387,21 +399,41 @@ class _AudioPlaybackController extends ChangeNotifier
+   void _syncForeground() {
+     if (_closed || _index < 0 || _index >= _chapters.length) return;
+     if (!AudioPreferences.instance.backgroundPlayback.value) {
++      _foregroundSignature = null;
++      _foregroundSyncedAt = null;
+       unawaited(NativePlayer.stopListenForeground());
+       return;
+     }
+     final player = _player;
+     final isPlaying =
+         (player?.playing ?? false) && _wantPlay && !_completed && !_loading;
++    final hasPrev = _index > 0;
++    final hasNext = _index < _chapters.length - 1;
++    final episode = _chapters[_index].title;
++    // 元数据没变时最多 30 秒回一次：系统进度条靠 position+speed 自行外推，
++    // 5 秒重建一次 4 个 PendingIntent + MediaStyle + MediaSession 在手表上
++    // 是纯负担（原生服务侧还有第二道去重）。
++    final signature =
++        '$_title|$episode|$_cover|$isPlaying|$hasPrev|$hasNext|'
++        '${_duration.inMilliseconds}|$_rate';
++    final now = DateTime.now();
++    final last = _foregroundSyncedAt;
++    if (signature == _foregroundSignature &&
++        last != null &&
++        now.difference(last) < const Duration(seconds: 30)) {
++      return;
++    }
++    _foregroundSignature = signature;
++    _foregroundSyncedAt = now;
+     unawaited(
+       NativePlayer.startListenForeground(
+         title: _title,
+-        episode: _chapters[_index].title,
++        episode: episode,
+         // 通知大图 / 媒体卡封面用的是当前书籍封面，不是应用图标。
+         coverUrl: _cover,
+         playing: isPlaying,
+-        hasPrev: _index > 0,
+-        hasNext: _index < _chapters.length - 1,
++        hasPrev: hasPrev,
++        hasNext: hasNext,
+         // 位置 + 倍速交给系统外推，媒体卡片的进度条才会动；总时长是两侧时间的来源。
+         positionMs: player?.position.inMilliseconds ?? 0,
+         durationMs: _duration.inMilliseconds,
+@@ -455,6 +487,18 @@ class _AudioPlaybackController extends ChangeNotifier
+   void didChangeAppLifecycleState(AppLifecycleState state) {
+     if (_closed) return;
+     _appActive = state == AppLifecycleState.resumed;
++    if (_appActive) {
++      // 息屏期间后台直接换集若没走完（事件被丢弃 / 拉流失败），下标还停在
++      // 原章；回前台补一次重试，避免「必须亮屏才播下一集」的老毛病。
++      final from = _pendingAdvanceFrom;
++      _pendingAdvanceFrom = null;
++      if (from != null &&
++          AudioPreferences.instance.backgroundPlayback.value &&
++          _index == from &&
++          _index + 1 < _chapters.length) {
++        unawaited(_openChapter(_index + 1));
++      }
++    }
+     if (!_appActive) {
+       // 切换到后台或锁屏时立即持久化当前进度，防止后续被系统杀后台导致进度丢失。
+       unawaited(_persistProgress());
+@@ -641,8 +685,13 @@ class _AudioPlaybackController extends ChangeNotifier
+       _syncForeground();
+       _saveTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+         if (!player.playing) return;
++        if (!_appActive) {
++          // 息屏后没有界面，5 秒一次的双份磁盘写 + 通知刷新太重；降到 30 秒。
++          _backgroundSaveTicks = (_backgroundSaveTicks + 1) % 6;
++          if (_backgroundSaveTicks != 0) return;
++        }
+         unawaited(_persistProgress());
+-        // 每 5 秒回一次真实位置：系统进度条靠外推前进，缓冲/卡顿时会跑偏。
++        // 定时回一次真实位置：系统进度条靠外推前进，缓冲/卡顿时会跑偏。
+         _syncForeground();
+       });
+       _syncListenClock();
+@@ -935,9 +984,12 @@ class _AudioPlaybackController extends ChangeNotifier
+         if (!_current(generation, player)) return;
+         // Notifier-only: the 5Hz tick rebuilds the progress row, not the page.
+         _position.value = _boundedPosition(position, _duration);
+-        _publishReadAlong();
++        // 息屏后没有界面：字幕索引 / 段落映射 / 阅读跟随都是纯 Dart 计算加
++        // 多个 ValueListenableBuilder 重建，全跳过；回前台由下一个 tick 补上。
++        // 原生侧同时把位置上报从 200ms 降到 1000ms。
++        if (_appActive) _publishReadAlong();
+         // 片尾跳过：进入尾部区间就按「本章播完」处理，复用同一条完成路径，
+-        // 用 _skipOutroFired 挡住重复触发。
++        // 用 _skipOutroFired 挡住重复触发。这条必须后台也跑，否则连播会断。
+         if (!_completed &&
+             !_skipOutroFired &&
+             _skipPoints.atOutro(_position.value, _duration)) {
+@@ -947,7 +999,7 @@ class _AudioPlaybackController extends ChangeNotifier
+         // Publish the REAL playing state: a paused seek also fires this
+         // stream, and publishing playing=true would yank the reader back to
+         // the narrated page while paused.
+-        _publishListeningSession(playing: player.playing);
++        if (_appActive) _publishListeningSession(playing: player.playing);
+       }),
+       player.durationStream.listen((duration) {
+         if (!_current(generation, player) || duration <= Duration.zero) return;
+@@ -961,6 +1013,8 @@ class _AudioPlaybackController extends ChangeNotifier
+       }),
+       player.playingStream.listen((playing) {
+         if (!_current(generation, player)) return;
++        // 下一集真的起播了就销掉后台换集的重试标记。
++        if (playing) _pendingAdvanceFrom = null;
+         // Creation acknowledges prepare(), and API duration can be known
+         // before the CDN is readable. Keep the last successful chapter until
+         // this candidate actually starts foreground playback.
+@@ -970,8 +1024,10 @@ class _AudioPlaybackController extends ChangeNotifier
+         }
+         _syncListenClock();
+         _syncForeground();
+-        _publishListeningSession(playing: playing && _wantPlay);
+-        _update(() {});
++        if (_appActive) {
++          _publishListeningSession(playing: playing && _wantPlay);
++          _update(() {});
++        }
+       }),
+       player.bufferingStream.listen((_) {
+         if (!_current(generation, player)) return;
+@@ -1460,6 +1516,8 @@ class _AudioPlaybackController extends ChangeNotifier
+     ++_seekGeneration;
+     ++_settingsGeneration;
+     _saveTimer?.cancel();
++    _cancelAdvanceCountdown(this);
++    _pendingAdvanceFrom = null;
+     _sleepTimer?.cancel();
+     _sleepTimerTick?.cancel();
+     _listenTime.stop();
+diff --git a/lib/services/audio_playback_guard.dart b/lib/services/audio_playback_guard.dart
+index d7906ad..ac4df34 100644
+--- a/lib/services/audio_playback_guard.dart
++++ b/lib/services/audio_playback_guard.dart
+@@ -69,6 +69,16 @@ void _beginAdvanceCountdown(
+   if (c._closed || seconds <= 0) return;
+   c._advanceRemaining = seconds;
+   c._advanceCountdown.value = seconds;
++  // 换集归一次性定时器管，不靠 1Hz tick 累加。息屏 / 系统合并定时器时，
++  // tick 少走几次不会把「打开下一集」一起拖住。
++  c._advanceOneShot = Timer(Duration(seconds: seconds), () {
++    if (c._closed) return;
++    _cancelAdvanceCountdown(c);
++    if (c._index + 1 < c._chapters.length) {
++      unawaited(c._openChapter(c._index + 1));
++    }
++  });
++  // 这个 periodic 只刷「%s 后播放下一集」的角标，不再承担推进职责。
+   c._advanceTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
+     if (c._closed) {
+       timer.cancel();
+@@ -84,10 +94,6 @@ void _beginAdvanceCountdown(
+     c._advanceTimer = null;
+     c._advanceRemaining = null;
+     c._advanceCountdown.value = null;
+-    if (c._closed) return;
+-    if (c._index + 1 < c._chapters.length) {
+-      unawaited(c._openChapter(c._index + 1));
+-    }
+   });
+ }
+ 
+@@ -95,6 +101,8 @@ void _beginAdvanceCountdown(
+ void _cancelAdvanceCountdown(_AudioPlaybackController c) {
+   c._advanceTimer?.cancel();
+   c._advanceTimer = null;
++  c._advanceOneShot?.cancel();
++  c._advanceOneShot = null;
+   c._advanceRemaining = null;
+   if (c._advanceCountdown.value != null) {
+     c._advanceCountdown.value = null;
+@@ -117,7 +125,15 @@ void _onChapterFinished(
+     return;
+   }
+   if (shouldAdvance && c._index + 1 < c._chapters.length) {
+-    _beginAdvanceCountdown(c);
++    if (!c._appActive) {
++      // 息屏后没有帧调度，3 秒倒计时会被冻结到亮屏才补跑（旧行为）。
++      // 原生 completion 事件能在同一次事件循环里直接换集；配合服务端的
++      // PARTIAL_WAKE_LOCK，整条「播完 → 拉下一集 → 起播」不再等亮屏。
++      c._pendingAdvanceFrom = c._index;
++      unawaited(c._openChapter(c._index + 1));
++    } else {
++      _beginAdvanceCountdown(c);
++    }
+     return;
+   }
+   unawaited(c._pause(player, generation));
+diff --git a/lib/services/native_player.dart b/lib/services/native_player.dart
+index c93656c..ddada40 100644
+--- a/lib/services/native_player.dart
++++ b/lib/services/native_player.dart
+@@ -518,6 +518,18 @@ class NativePlayer {
+     }
+   }
+ 
++  /// 息屏 / 切后台时把原生位置上报从 200ms 降到 1000ms，回前台恢复。
++  /// 由 main() 注册的全局生命周期观察者统一调用，各播放链路不必各自维护。
++  static Future<void> setBackgroundMode(bool background) async {
++    try {
++      await _channel.invokeMethod<void>('setBackgroundMode', {
++        'background': background,
++      });
++    } catch (_) {
++      // 通道不可用（测试 / 引擎已卸载）时忽略。
++    }
++  }
++
+   /// 悬浮窗权限：Android 需要用户在系统设置里允许“显示在其他应用的上层”。
+   static Future<bool> canDrawOverlays() async {
+     try {
+diff --git a/lib/services/native_text_input.dart b/lib/services/native_text_input.dart
+new file mode 100644
+index 0000000..c7de0aa
+--- /dev/null
++++ b/lib/services/native_text_input.dart
+@@ -0,0 +1,33 @@
++import 'package:flutter/services.dart';
++
++/// 原生文本输入桥。
++///
++/// 手表（窄屏）上 Flutter 自己的 TextField 调不出系统输入法：IME 窗口建好了、
++/// `mInputShown=true`，但 `mDrawState` 卡在 READY_TO_SHOW、`shown=false`，永远
++/// 不出首帧。原生 EditText 不受影响，所以窄屏改走这里——由原生浮层承载输入，
++/// 系统输入法（搜狗手表版）就能正常弹出、正常打中文。
++///
++/// 桌面/手机不经过这里，仍用普通 TextField。
++class NativeTextInput {
++  const NativeTextInput._();
++
++  static const MethodChannel _channel = MethodChannel('fqapp/native_input');
++
++  /// 打开原生输入浮层。返回用户确定的文本；取消或通道不可用时返回 null。
++  static Future<String?> open({
++    String initial = '',
++    String hint = '',
++  }) async {
++    try {
++      return await _channel.invokeMethod<String>('open', {
++        'initial': initial,
++        'hint': hint,
++      });
++    } on MissingPluginException {
++      // 非 Android 构建（或有测试桩）时静默退化为原来的输入框。
++      return null;
++    } on PlatformException {
++      return null;
++    }
++  }
++}
+diff --git a/lib/widgets/compact_shell_dock.dart b/lib/widgets/compact_shell_dock.dart
+new file mode 100644
+index 0000000..3180fcf
+--- /dev/null
++++ b/lib/widgets/compact_shell_dock.dart
+@@ -0,0 +1,93 @@
++import 'package:flutter/cupertino.dart';
++import 'package:flutter/material.dart';
++
++import 'home/home_design.dart';
++
++/// 低于这个逻辑宽度就换成紧凑 dock。
++///
++/// 手机最窄也在 360dp 以上，只有手表/极窄分屏会落进来（OPPO Watch 3 Pro
++/// 改完密度后是 320dp）。
++const double compactShellDockBreakpoint = 340;
++
++/// 窄屏（手表）下的底部导航。
++///
++/// 上游的玻璃胶囊 dock 是 54dp 高 + 12dp 底距，在 320×420dp 的画布上要占
++/// 掉近六分之一高度，胶囊本身也会把四个入口挤成一排细缝。窄屏这里换成
++/// 等分图标条：入口、顺序、选中逻辑都和 [ShellDock] 一致，去掉玻璃底板、
++/// 拖动预览与滑动手势，高度降到 48dp。
++class CompactShellDock extends StatelessWidget {
++  const CompactShellDock({
++    super.key,
++    required this.selectedIndex,
++    required this.onSelected,
++    required this.palette,
++    required this.overVideo,
++  });
++
++  final int selectedIndex;
++  final ValueChanged<int> onSelected;
++  final HomePalette palette;
++
++  /// 短剧推荐频道背后是全屏视频流：底板按深色画布绘制，与 [ShellDock] 一致。
++  final bool overVideo;
++
++  static const _items = <({IconData icon, String label})>[
++    (icon: CupertinoIcons.house, label: '首页'),
++    (icon: CupertinoIcons.play, label: '短剧'),
++    (icon: CupertinoIcons.book, label: '书架'),
++    (icon: CupertinoIcons.person_crop_circle, label: '我的'),
++  ];
++
++  @override
++  Widget build(BuildContext context) {
++    final background = overVideo ? const Color(0xFF191919) : palette.surface;
++    return Material(
++      color: background,
++      child: SafeArea(
++        top: false,
++        child: Container(
++          height: 48,
++          decoration: BoxDecoration(
++            border: Border(
++              top: BorderSide(color: palette.line, width: 0.5),
++            ),
++          ),
++          child: Row(
++            children: [
++              for (var index = 0; index < _items.length; index++)
++                Expanded(child: _buildItem(index)),
++            ],
++          ),
++        ),
++      ),
++    );
++  }
++
++  Widget _buildItem(int index) {
++    final item = _items[index];
++    final selected = index == selectedIndex;
++    // 墨水屏下 accentText 与 muted 都是纯黑，靠字重与图标是否实心来区分。
++    final color = selected ? palette.ink : palette.muted;
++    return InkWell(
++      onTap: () => onSelected(index),
++      child: Column(
++        mainAxisAlignment: MainAxisAlignment.center,
++        children: [
++          Icon(item.icon, size: 19, color: color),
++          const SizedBox(height: 2),
++          Text(
++            item.label,
++            maxLines: 1,
++            overflow: TextOverflow.clip,
++            style: TextStyle(
++              fontSize: 10,
++              height: 1.1,
++              color: color,
++              fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
++            ),
++          ),
++        ],
++      ),
++    );
++  }
++}
+diff --git a/lib/widgets/wenku/app_search_field.dart b/lib/widgets/wenku/app_search_field.dart
+index 17ef08b..c6d4814 100644
+--- a/lib/widgets/wenku/app_search_field.dart
++++ b/lib/widgets/wenku/app_search_field.dart
+@@ -21,6 +21,7 @@ class AppSearchField extends StatefulWidget {
+     this.trailing,
+     this.autofocus = false,
+     this.clearTooltip = '清空搜索',
++    this.onTapOverride,
+   });
+ 
+   final Key? inputKey;
+@@ -35,6 +36,10 @@ class AppSearchField extends StatefulWidget {
+   final bool autofocus;
+   final String clearTooltip;
+ 
++  /// 非空时输入框退化为"只读的按钮"：点击不聚焦、不弹输入法，而是回调这里。
++  /// 手表上用它把输入交给原生浮层（见 NativeTextInput）。
++  final VoidCallback? onTapOverride;
++
+   @override
+   State<AppSearchField> createState() => _AppSearchFieldState();
+ }
+@@ -70,10 +75,16 @@ class _AppSearchFieldState extends State<AppSearchField> {
+               key: widget.inputKey,
+               controller: _text,
+               focusNode: widget.focusNode,
+-              autofocus: widget.autofocus,
++              // 交给原生浮层时保持只读：只读字段不会申请输入法，正好绕开
++              // 这台表上「Flutter 输入法永不显示」的问题。
++              readOnly: widget.onTapOverride != null,
++              autofocus: widget.autofocus && widget.onTapOverride == null,
+               textInputAction: TextInputAction.search,
+               style: const TextStyle(fontSize: 14, height: 1.25),
+-              onTap: () => AppHaptics.play(context, HapticCue.selection),
++              onTap: () {
++                AppHaptics.play(context, HapticCue.selection);
++                widget.onTapOverride?.call();
++              },
+               onTapAlwaysCalled: true,
+               onChanged: widget.onChanged,
+               onSubmitted: (value) {
+diff --git a/pubspec.lock b/pubspec.lock
+index 0c287f2..ab7a3f5 100644
+--- a/pubspec.lock
++++ b/pubspec.lock
+@@ -6,7 +6,7 @@ packages:
+     description:
+       name: archive
+       sha256: de5ac590b8155e4e676088d714bd41ea620449a6adc0f7950c5073874b287ddb
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.6.0"
+   args:
+@@ -14,7 +14,7 @@ packages:
+     description:
+       name: args
+       sha256: d0481093c50b1da8910eb0bb301626d4d8eb7284aa739614d2b394ee09e3ea04
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.7.0"
+   async:
+@@ -22,7 +22,7 @@ packages:
+     description:
+       name: async
+       sha256: e2eb0491ba5ddb6177742d2da23904574082139b07c1e33b8503b9f46f3e1a37
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.13.1"
+   boolean_selector:
+@@ -30,7 +30,7 @@ packages:
+     description:
+       name: boolean_selector
+       sha256: "8aab1771e1243a5063b8b0ff68042d67334e3feab9e95b9490f9a6ebf73b42ea"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.2"
+   build_cli_annotations:
+@@ -38,7 +38,7 @@ packages:
+     description:
+       name: build_cli_annotations
+       sha256: e563c2e01de8974566a1998410d3f6f03521788160a02503b0b1f1a46c7b3d95
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.1"
+   cached_network_image:
+@@ -46,7 +46,7 @@ packages:
+     description:
+       name: cached_network_image
+       sha256: f865286d78afe21964f8a22f7e7e798ab6b0cceb6608effe4e31983776f4736f
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.0.6"
+   cached_network_image_platform_interface:
+@@ -54,7 +54,7 @@ packages:
+     description:
+       name: cached_network_image_platform_interface
+       sha256: "555e287d3882fbb36cde50d24214cb3f6a272d39c4386e8afe00cb188d35b285"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.3"
+   cached_network_image_web:
+@@ -62,7 +62,7 @@ packages:
+     description:
+       name: cached_network_image_web
+       sha256: "99ba26ba4de2fd5524b84a8c6f14931aaeb25d740a954e92d8249e7be6cd9e31"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.4"
+   characters:
+@@ -70,7 +70,7 @@ packages:
+     description:
+       name: characters
+       sha256: faf38497bda5ead2a8c7615f4f7939df04333478bf32e4173fcb06d428b5716b
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.1"
+   clock:
+@@ -78,23 +78,23 @@ packages:
+     description:
+       name: clock
+       sha256: e51d50bca3217c9a9fa2b41a30e4a38971133f5f9ec7a3d57bae095007f1d28e
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.3"
+   code_assets:
+     dependency: transitive
+     description:
+       name: code_assets
+-      sha256: "828110d598123b5ea96c00c9f3c72105bf79f8ee36c20a39b26209ade421ec57"
+-      url: "https://pub.dev"
++      sha256: "1ef22a0be3af9370bd9481ac76db114db92bfe75d5ca2b2d7bc911764478a4d9"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.1.0"
++    version: "2.2.0"
+   collection:
+     dependency: transitive
+     description:
+       name: collection
+       sha256: "2f5709ae4d3d59dd8f7cd309b4e023046b57d8a6c82130785d2b0e5868084e76"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.19.1"
+   connectivity_plus:
+@@ -102,7 +102,7 @@ packages:
+     description:
+       name: connectivity_plus
+       sha256: "762c99f890ca8bf87f7337236f99edd42793843bc6c3631da294a76653a54bd0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.3.1"
+   connectivity_plus_platform_interface:
+@@ -110,7 +110,7 @@ packages:
+     description:
+       name: connectivity_plus_platform_interface
+       sha256: "3c09627c536d22fd24691a905cdd8b14520de69da52c7a97499c8be5284a32ed"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.0"
+   cross_file:
+@@ -118,7 +118,7 @@ packages:
+     description:
+       name: cross_file
+       sha256: f141ea4f277af142a0356955707f6556f37b03947d39d55585981a06ca437bd6
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.3.5+5"
+   crypto:
+@@ -126,7 +126,7 @@ packages:
+     description:
+       name: crypto
+       sha256: e3626ae6270383c9e3a549f34c9e4cd26c09ae6a9adaab2bf4737a00340efdc4
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.8"
+   csslib:
+@@ -134,7 +134,7 @@ packages:
+     description:
+       name: csslib
+       sha256: "09bad715f418841f976c77db72d5398dc1253c21fb9c0c7f0b0b985860b2d58e"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.2"
+   cupertino_icons:
+@@ -142,23 +142,23 @@ packages:
+     description:
+       name: cupertino_icons
+       sha256: "41e005c33bd814be4d3096aff55b1908d419fde52ca656c8c47719ec745873cd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.9"
+   cupertino_ui:
+     dependency: transitive
+     description:
+       name: cupertino_ui
+-      sha256: e003b87afde18cb396ec15928c7894063d64af04462c68df9a1404c461316dd2
+-      url: "https://pub.dev"
++      sha256: "369e39a1c5c030a6212589c3da1809920b1c2cfade7b02aade7695bfa4b88c3a"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.1.5"
++    version: "1.1.6"
+   dbus:
+     dependency: transitive
+     description:
+       name: dbus
+       sha256: a48d5da28e89bd02196e80d81ed8d7954923d00a0f4a68cc20b575038f023383
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.15"
+   fake_async:
+@@ -166,7 +166,7 @@ packages:
+     description:
+       name: fake_async
+       sha256: "5368f224a74523e8d2e7399ea1638b37aecfca824a3cc4dfdf77bf1fa905ac44"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.3"
+   ffi:
+@@ -174,7 +174,7 @@ packages:
+     description:
+       name: ffi
+       sha256: "6d7fd89431262d8f3125e81b50d3847a091d846eafcd4fdb88dd06f36d705a45"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.0"
+   file:
+@@ -182,7 +182,7 @@ packages:
+     description:
+       name: file
+       sha256: a3b4f84adafef897088c160faf7dfffb7696046cb13ae90b508c2cbc95d3b8d4
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.0.1"
+   file_selector:
+@@ -190,7 +190,7 @@ packages:
+     description:
+       name: file_selector
+       sha256: bd15e43e9268db636b53eeaca9f56324d1622af30e5c34d6e267649758c84d9a
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   file_selector_android:
+@@ -198,7 +198,7 @@ packages:
+     description:
+       name: file_selector_android
+       sha256: d670cd0ce77a2e785b18d8b4d0a8d6a222d6a813ec9b7ddf2790a1b4fb6fa92c
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.2+11"
+   file_selector_ios:
+@@ -206,7 +206,7 @@ packages:
+     description:
+       name: file_selector_ios
+       sha256: "5b42ec0ef7626124b4624ea244341e9df780406793c204e89fa68a2e71af115c"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.3+7"
+   file_selector_linux:
+@@ -214,7 +214,7 @@ packages:
+     description:
+       name: file_selector_linux
+       sha256: da76400e7872ce7637ffdce12749ec24169c25f6195c28372208e65a24bcd2ab
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.4+1"
+   file_selector_macos:
+@@ -222,7 +222,7 @@ packages:
+     description:
+       name: file_selector_macos
+       sha256: d785431f1910aac8a50e5c492cae912320158030a88703c67b9ef7f1f96fd7ba
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.5+2"
+   file_selector_platform_interface:
+@@ -230,7 +230,7 @@ packages:
+     description:
+       name: file_selector_platform_interface
+       sha256: "35e0bd61ebcdb91a3505813b055b09b79dfdc7d0aee9c09a7ba59ae4bb13dc85"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.7.0"
+   file_selector_web:
+@@ -238,7 +238,7 @@ packages:
+     description:
+       name: file_selector_web
+       sha256: "73181fbc5257776d8ecaa6a94ab3c8e920ad143b9132a6d984a9271dfc6928d3"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.5"
+   file_selector_windows:
+@@ -246,7 +246,7 @@ packages:
+     description:
+       name: file_selector_windows
+       sha256: fbefc5fb92c6d3cbe8d284a2cd971b593bb07d2cd6da8557b81a862250b4acec
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.9.3+6"
+   fixnum:
+@@ -254,7 +254,7 @@ packages:
+     description:
+       name: fixnum
+       sha256: b6dc7065e46c974bc7c5f143080a6764ec7a4be6da1285ececdc37be96de53be
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.1"
+   flutter:
+@@ -266,10 +266,10 @@ packages:
+     dependency: "direct main"
+     description:
+       name: flutter_cache_manager
+-      sha256: "32a5365c71c6e972e0df72551151bbcb45a8d43cf1936b50b4af574c0a984555"
+-      url: "https://pub.dev"
++      sha256: a42024cf8bbb7e1f4d2875301660f62543601a4c3b20119ea9a683e4d191d0f4
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "3.4.7"
++    version: "3.5.0"
+   flutter_driver:
+     dependency: transitive
+     description: flutter
+@@ -280,7 +280,7 @@ packages:
+     description:
+       name: flutter_lints
+       sha256: "3105dc8492f6183fb076ccf1f351ac3d60564bff92e20bfc4af9cc1651f4e7e1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.0.0"
+   flutter_localizations:
+@@ -293,23 +293,23 @@ packages:
+     description:
+       name: flutter_lucide
+       sha256: "98725213e79f07413572880ab1cde90070ce64e79ce986a73ac587f04d834bf2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.59.0"
+   flutter_riverpod:
+     dependency: "direct main"
+     description:
+       name: flutter_riverpod
+-      sha256: "2b7f9d2a3c730ac1a98221b420cef966b990fca7ab546ede324642ca57a533e3"
+-      url: "https://pub.dev"
++      sha256: "2ae1a93a868ae5f2d5358f521a4bfae0da7a3bfe77a60515ab5c28953b50557f"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "3.4.3"
++    version: "3.5.0"
+   flutter_rust_bridge:
+     dependency: "direct main"
+     description:
+       name: flutter_rust_bridge
+       sha256: ec69331e2335ab4d456c0a9fc700892c2c85b72b9c0cb39df3ecfe8833d5d5c8
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.13.0"
+   flutter_secure_storage:
+@@ -317,7 +317,7 @@ packages:
+     description:
+       name: flutter_secure_storage
+       sha256: "9cad52d75ebc511adfae3d447d5d13da15a55a92c9410e50f67335b6d21d16ea"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "9.2.4"
+   flutter_secure_storage_linux:
+@@ -325,7 +325,7 @@ packages:
+     description:
+       name: flutter_secure_storage_linux
+       sha256: be76c1d24a97d0b98f8b54bce6b481a380a6590df992d0098f868ad54dc8f688
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.3"
+   flutter_secure_storage_macos:
+@@ -333,7 +333,7 @@ packages:
+     description:
+       name: flutter_secure_storage_macos
+       sha256: "6c0a2795a2d1de26ae202a0d78527d163f4acbb11cde4c75c670f3a0fc064247"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.3"
+   flutter_secure_storage_platform_interface:
+@@ -341,7 +341,7 @@ packages:
+     description:
+       name: flutter_secure_storage_platform_interface
+       sha256: cf91ad32ce5adef6fba4d736a542baca9daf3beac4db2d04be350b87f69ac4a8
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.2"
+   flutter_secure_storage_web:
+@@ -349,7 +349,7 @@ packages:
+     description:
+       name: flutter_secure_storage_web
+       sha256: f4ebff989b4f07b2656fb16b47852c0aab9fed9b4ec1c70103368337bc1886a9
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.1"
+   flutter_secure_storage_windows:
+@@ -357,7 +357,7 @@ packages:
+     description:
+       name: flutter_secure_storage_windows
+       sha256: b20b07cb5ed4ed74fc567b78a72936203f587eba460af1df11281c9326cd3709
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.2"
+   flutter_svg:
+@@ -365,7 +365,7 @@ packages:
+     description:
+       name: flutter_svg
+       sha256: "100c19dcc4ff60083e95a44a6f44f3a1bb887d353c5d86f6a9b688aa3cb46236"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.2"
+   flutter_test:
+@@ -378,7 +378,7 @@ packages:
+     description:
+       name: flutter_tts
+       sha256: ce5eb209b40e95f2f4a1397116c87ab2fcdff32257d04ed7a764e75894c03775
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.2.5"
+   flutter_web_plugins:
+@@ -395,16 +395,16 @@ packages:
+     dependency: "direct main"
+     description:
+       name: hive_ce
+-      sha256: "8b6eea82b06a7e2bb298a6a279139c45838b82491a66f3972bf609d48681392a"
+-      url: "https://pub.dev"
++      sha256: c293d31ea3f617143f3309c620baba3ee5949c75c5ba2c8558cc2f7d517a730d
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.22.0"
++    version: "2.23.0"
+   hive_ce_flutter:
+     dependency: "direct main"
+     description:
+       name: hive_ce_flutter
+       sha256: "7853fb2924c5dd6715c81f7a5cc4574afe4aac3c2d7ecd657fdeba409505f1d1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.5.0"
+   hooks:
+@@ -412,7 +412,7 @@ packages:
+     description:
+       name: hooks
+       sha256: eaac480a35ec0814146c2c48d96aaa829e0e44a7662c88ae84c9edf4bc35651f
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.0"
+   html:
+@@ -420,7 +420,7 @@ packages:
+     description:
+       name: html
+       sha256: "6d1264f2dffa1b1101c25a91dff0dc2daee4c18e87cd8538729773c073dbf602"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.15.6"
+   http:
+@@ -428,7 +428,7 @@ packages:
+     description:
+       name: http
+       sha256: "87721a4a50b19c7f1d49001e51409bddc46303966ce89a65af4f4e6004896412"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.6.0"
+   http_parser:
+@@ -436,7 +436,7 @@ packages:
+     description:
+       name: http_parser
+       sha256: "178d74305e7866013777bab2c3d8726205dc5a4dd935297175b19a23a2e66571"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.1.2"
+   image:
+@@ -444,7 +444,7 @@ packages:
+     description:
+       name: image
+       sha256: "89ed75b2f8231fe676808c5564f9590d728024ded7ac782a7ed8474f1c95b72a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.12.0"
+   integration_test:
+@@ -457,31 +457,31 @@ packages:
+     description:
+       name: intl
+       sha256: "1ca20c894b1717686a2319b8548763d812bc0aabdac580420a44c5178c57a867"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.20.3"
+   isolate_channel:
+     dependency: transitive
+     description:
+       name: isolate_channel
+-      sha256: a9d3d620695bc984244dafae00b95e4319d6974b2d77f4b9e1eb4f2efe099094
+-      url: "https://pub.dev"
++      sha256: bd56e1bb2787bed914158c2696943dc7254732bfea2c207aafca6bc930580fd4
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "0.6.1"
++    version: "0.6.2"
+   jni:
+     dependency: transitive
+     description:
+       name: jni
+-      sha256: d8df6dab6847855512fe44dd9032b0bbe34dda7bf7597e41d30750879779813f
+-      url: "https://pub.dev"
++      sha256: "2e91e6087291affd10b31b6c872f3e3ac7dc5d93b51b5ba485d930c8f08bde6c"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.1.1"
++    version: "1.1.2"
+   jni_flutter:
+     dependency: transitive
+     description:
+       name: jni_flutter
+       sha256: "0dd33d67797560f66e961a6053882d4df54bd345bf063b8fe7ea133f7ad8b191"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.4+1"
+   jni_util:
+@@ -489,7 +489,7 @@ packages:
+     description:
+       name: jni_util
+       sha256: "1ba86da04a5f2bf18fde2edb235587e70c5b0fc5bd4ba955f46b00942c3fc35f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.0"
+   js:
+@@ -497,7 +497,7 @@ packages:
+     description:
+       name: js
+       sha256: f2c445dce49627136094980615a031419f7f3eb393237e4ecd97ac15dea343f3
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.6.7"
+   json_annotation:
+@@ -505,7 +505,7 @@ packages:
+     description:
+       name: json_annotation
+       sha256: "2a743920d81b7910627f68ee2c9ac1fc0bfee32b9fc3403587d7c6791ca12f80"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.12.0"
+   leak_tracker:
+@@ -513,7 +513,7 @@ packages:
+     description:
+       name: leak_tracker
+       sha256: "33e2e26bdd85a0112ec15400c8cbffea70d0f9c3407491f672a2fad47915e2de"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "11.0.2"
+   leak_tracker_flutter_testing:
+@@ -521,7 +521,7 @@ packages:
+     description:
+       name: leak_tracker_flutter_testing
+       sha256: "1dbc140bb5a23c75ea9c4811222756104fbcd1a27173f0c34ca01e16bea473c1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.10"
+   leak_tracker_testing:
+@@ -529,7 +529,7 @@ packages:
+     description:
+       name: leak_tracker_testing
+       sha256: "8d5a2d49f4a66b49744b23b018848400d23e54caf9463f4eb20df3eb8acb2eb1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.2"
+   lints:
+@@ -537,7 +537,7 @@ packages:
+     description:
+       name: lints
+       sha256: "12f842a479589fea194fe5c5a3095abc7be0c1f2ddfa9a0e76aed1dbd26a87df"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.1.0"
+   liquid_glass_easy:
+@@ -552,7 +552,7 @@ packages:
+     description:
+       name: listen
+       sha256: "47501a08016a43fcad79252439d723f50f14f88fa7bfd8a177e0a417e5c9e1f2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.1"
+   logging:
+@@ -560,7 +560,7 @@ packages:
+     description:
+       name: logging
+       sha256: c8245ada5f1717ed44271ed1c26b8ce85ca3228fd2ffdb75468ab01979309d61
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.0"
+   lottie:
+@@ -568,7 +568,7 @@ packages:
+     description:
+       name: lottie
+       sha256: "3ce005da56c2ce38b97d2fe8ca812627d12aae3d13bb611f735c4a506cdf46b9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.8.2"
+   matcher:
+@@ -576,7 +576,7 @@ packages:
+     description:
+       name: matcher
+       sha256: "31bd099b47c10cd1aeb55146a2d46ce0277630ecef3f7dae54ad7873f36696cd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.12.20"
+   material_color_utilities:
+@@ -584,23 +584,23 @@ packages:
+     description:
+       name: material_color_utilities
+       sha256: "9c337007e82b1889149c82ed242ed1cb24a66044e30979c44912381e9be4c48b"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.13.0"
+   material_ui:
+     dependency: transitive
+     description:
+       name: material_ui
+-      sha256: feb289df1e5f9ed9522f9fe3d909432a7f7bc76943f16abad09f80a16cd25196
+-      url: "https://pub.dev"
++      sha256: a30f5d0625b6b83770f53ca3f7aafd6fd9d147cb3853f54a70668541046fe5d6
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.9.0"
++    version: "1.10.0"
+   media_kit:
+     dependency: "direct main"
+     description:
+       name: media_kit
+       sha256: ae9e79597500c7ad6083a3c7b7b7544ddabfceacce7ae5c9709b0ec16a5d6643
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.6"
+   media_kit_libs_windows_video:
+@@ -608,7 +608,7 @@ packages:
+     description:
+       name: media_kit_libs_windows_video
+       sha256: dff76da2778729ab650229e6b4ec6ec111eb5151431002cbd7ea304ff1f112ab
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.11"
+   media_kit_video:
+@@ -616,7 +616,7 @@ packages:
+     description:
+       name: media_kit_video
+       sha256: afaa509e7b7e0bf247557a3a740cde903a52c34ace9810f94500e127bd7b043d
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.1"
+   meta:
+@@ -624,7 +624,7 @@ packages:
+     description:
+       name: meta
+       sha256: "307249ce4ff29d58a18e97f6345f539382eb9c9c29ecda628900f31de0443dd9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.19.0"
+   nm:
+@@ -632,23 +632,23 @@ packages:
+     description:
+       name: nm
+       sha256: "2c9aae4127bdc8993206464fcc063611e0e36e72018696cd9631023a31b24254"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.0"
+   objective_c:
+     dependency: transitive
+     description:
+       name: objective_c
+-      sha256: "5c80c2ad6e2c0397de5db38c6d653e69616a3397e13aa7633bf39eb668f2041b"
+-      url: "https://pub.dev"
++      sha256: "322d5f1f0680534acaf557c5d68e97b40c3800ee5e15b63dcacc3c31504674c2"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "9.6.2"
++    version: "9.6.3"
+   octo_image:
+     dependency: transitive
+     description:
+       name: octo_image
+       sha256: "1db70031049945ac032e3d1c7a53739ce8c3f721d0e3c15aecfc2858ea5112a4"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.3"
+   package_config:
+@@ -656,7 +656,7 @@ packages:
+     description:
+       name: package_config
+       sha256: ffcf4cf3d6c0b74ac43708d9f56625506e8a68aa935abe9d267a7330f320eb5d
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.0"
+   package_info_plus:
+@@ -664,7 +664,7 @@ packages:
+     description:
+       name: package_info_plus
+       sha256: "468c26b4254ab01979fa5e4a98cb343ea3631b9acee6f21028997419a80e1a20"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "9.0.1"
+   package_info_plus_platform_interface:
+@@ -672,7 +672,7 @@ packages:
+     description:
+       name: package_info_plus_platform_interface
+       sha256: "202a487f08836a592a6bd4f901ac69b3a8f146af552bbd14407b6b41e1c3f086"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.1"
+   path:
+@@ -680,7 +680,7 @@ packages:
+     description:
+       name: path
+       sha256: "75cca69d1490965be98c73ceaea117e8a04dd21217b37b292c9ddbec0d955bc5"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.9.1"
+   path_parsing:
+@@ -688,7 +688,7 @@ packages:
+     description:
+       name: path_parsing
+       sha256: "883402936929eac138ee0a45da5b0f2c80f89913e6dc3bf77eb65b84b409c6ca"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   path_provider:
+@@ -696,7 +696,7 @@ packages:
+     description:
+       name: path_provider
+       sha256: a7f4874f987173da295a61c181b8ee71dab59b332a486b391babf26a1b884825
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.6"
+   path_provider_android:
+@@ -704,7 +704,7 @@ packages:
+     description:
+       name: path_provider_android
+       sha256: "69cbd515a62b94d32a7944f086b2f82b4ac40a1d45bebfc00813a430ab2dabcd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.1"
+   path_provider_foundation:
+@@ -712,7 +712,7 @@ packages:
+     description:
+       name: path_provider_foundation
+       sha256: "2a376b7d6392d80cd3705782d2caa734ca4727776db0b6ec36ef3f1855197699"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.6.0"
+   path_provider_linux:
+@@ -720,7 +720,7 @@ packages:
+     description:
+       name: path_provider_linux
+       sha256: "58c2005f147315b11e9b4a7bc889cd5203e250cba8e3f012dae259b4972b5c16"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.2"
+   path_provider_platform_interface:
+@@ -728,7 +728,7 @@ packages:
+     description:
+       name: path_provider_platform_interface
+       sha256: "484838772624c3a4b94f1e44a3e19897fee738f2d5c4ce448443b0417f7c9dda"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.3"
+   path_provider_windows:
+@@ -736,7 +736,7 @@ packages:
+     description:
+       name: path_provider_windows
+       sha256: bd6f00dbd873bfb70d0761682da2b3a2c2fccc2b9e84c495821639601d81afe7
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.0"
+   petitparser:
+@@ -744,7 +744,7 @@ packages:
+     description:
+       name: petitparser
+       sha256: "2f1564aadb14215e478563b5406cb80729d022158c01dc50c96013c2f7eb4790"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.1.0"
+   platform:
+@@ -752,7 +752,7 @@ packages:
+     description:
+       name: platform
+       sha256: a36d119c13416516a7b5913fbe8af8531e11633d784c550b2125f76c758524ec
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.0"
+   plugin_platform_interface:
+@@ -760,7 +760,7 @@ packages:
+     description:
+       name: plugin_platform_interface
+       sha256: "4820fbfdb9478b1ebae27888254d445073732dae3d6ea81f0b7e06d5dedc3f02"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.8"
+   posix:
+@@ -768,7 +768,7 @@ packages:
+     description:
+       name: posix
+       sha256: "613646d076944f3acc125830af935b48d4b8a57a388691547bbfd25b434f4d63"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.5.4"
+   process:
+@@ -776,7 +776,7 @@ packages:
+     description:
+       name: process
+       sha256: "4242ba3508d37e01808bdf71ad1d5bb93a8d671bf2e7450e6b1b353fb0808891"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.0.6"
+   pub_semver:
+@@ -784,7 +784,7 @@ packages:
+     description:
+       name: pub_semver
+       sha256: "261236774e8b1d69cfc6b9eabbc96c40f25e7a2d6b171f3385d4f65d5734fb24"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.2.1"
+   record_use:
+@@ -792,23 +792,23 @@ packages:
+     description:
+       name: record_use
+       sha256: "1cb8564af8d43b464294411db9217f5ec04891c6f22ee2c32d73ae05e88a6bd2"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.1"
+   riverpod:
+     dependency: transitive
+     description:
+       name: riverpod
+-      sha256: "484dfc873ea4c4f4240e5635444fa066f87b07862b7279ebd004a2b71fba4b7a"
+-      url: "https://pub.dev"
++      sha256: "24cbce92e87088cae0dd06caac3876c0b3abfd084901e7a93a3254d6daf4937d"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "3.4.3"
++    version: "3.5.0"
+   rxdart:
+     dependency: transitive
+     description:
+       name: rxdart
+       sha256: "5c3004a4a8dbb94bd4bf5412a4def4acdaa12e12f269737a5751369e12d1a962"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.28.0"
+   safe_local_storage:
+@@ -816,7 +816,7 @@ packages:
+     description:
+       name: safe_local_storage
+       sha256: "76288b689a3e1fddccb377177feed85d73fdfc64c9c3c52991e2d9aba35c4857"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.0.7"
+   screen_retriever:
+@@ -824,7 +824,7 @@ packages:
+     description:
+       name: screen_retriever
+       sha256: ace919117a7520c13a50a6259e60c4a0d4cbe98809468792a91b5c5adada2aa6
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   screen_retriever_linux:
+@@ -832,7 +832,7 @@ packages:
+     description:
+       name: screen_retriever_linux
+       sha256: "7b52006a5ceae1f3d5af7f77188c3290d6e7d8ded16d99809bea84967c65c257"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   screen_retriever_macos:
+@@ -840,7 +840,7 @@ packages:
+     description:
+       name: screen_retriever_macos
+       sha256: a1489b99cce597c45a54b9aae1cd94c8d4705353b7e0bb2457a6e4de44e0ad8a
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   screen_retriever_platform_interface:
+@@ -848,7 +848,7 @@ packages:
+     description:
+       name: screen_retriever_platform_interface
+       sha256: "94a5535277510a63184ca178ce12a1449bc0b38618879aa1c18bf57369c5064a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   screen_retriever_windows:
+@@ -856,7 +856,7 @@ packages:
+     description:
+       name: screen_retriever_windows
+       sha256: dafc6922b0bfbf1d48cf3ccbf519b4fff47bdcb820da1728ea6db675fecc9324
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.2.2"
+   shared_preferences:
+@@ -864,7 +864,7 @@ packages:
+     description:
+       name: shared_preferences
+       sha256: "1e85e0dccf5b4a016077fea7dfbb4a7cb39c759ac1596fcf60c06deadb7da91f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.5.6"
+   shared_preferences_android:
+@@ -872,7 +872,7 @@ packages:
+     description:
+       name: shared_preferences_android
+       sha256: "33b38b07d9ac7d16aff0426c61418752fd3e7a8c7dc8be786c875d6ce673b002"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.5.4"
+   shared_preferences_foundation:
+@@ -880,7 +880,7 @@ packages:
+     description:
+       name: shared_preferences_foundation
+       sha256: "4e396ac6f8751ab7d2d6e27f22f32c8350b07006028d534f5221503382f1fa69"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.6.1"
+   shared_preferences_linux:
+@@ -888,7 +888,7 @@ packages:
+     description:
+       name: shared_preferences_linux
+       sha256: "580abfd40f415611503cae30adf626e6656dfb2f0cee8f465ece7b6defb40f2f"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.1"
+   shared_preferences_platform_interface:
+@@ -896,7 +896,7 @@ packages:
+     description:
+       name: shared_preferences_platform_interface
+       sha256: "649dc798a33931919ea356c4305c2d1f81619ea6e92244070b520187b5140ef9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.2"
+   shared_preferences_web:
+@@ -904,7 +904,7 @@ packages:
+     description:
+       name: shared_preferences_web
+       sha256: c49bd060261c9a3f0ff445892695d6212ff603ef3115edbb448509d407600019
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   shared_preferences_windows:
+@@ -912,7 +912,7 @@ packages:
+     description:
+       name: shared_preferences_windows
+       sha256: "94ef0f72b2d71bc3e700e025db3710911bd51a71cefb65cc609dd0d9a982e3c1"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.1"
+   sky_engine:
+@@ -925,7 +925,7 @@ packages:
+     description:
+       name: smtc_windows
+       sha256: dee279b0ddf663c4c729a88bca4e57fb4861aa1b3d01e230bdbf1277b8bfe664
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   source_span:
+@@ -933,7 +933,7 @@ packages:
+     description:
+       name: source_span
+       sha256: "56a02f1f4cd1a2d96303c0144c93bd6d909eea6bee6bf5a0e0b685edbd4c47ab"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.10.2"
+   sqflite:
+@@ -941,7 +941,7 @@ packages:
+     description:
+       name: sqflite
+       sha256: "21a9750de2deb464946e9f41c7ddf176e25553618afdfc774868cd454990c06a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.5"
+   sqflite_android:
+@@ -949,31 +949,31 @@ packages:
+     description:
+       name: sqflite_android
+       sha256: "3986f4cbdde19ca538aae877981c5a53400dcc4601499df18e7ed9e848a0bdd4"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.5"
+   sqflite_common:
+     dependency: transitive
+     description:
+       name: sqflite_common
+-      sha256: b80e94ff0d551d5f1f8c7d14348d29b576cca3ae30f6e195a7c380552c32b1e0
+-      url: "https://pub.dev"
++      sha256: cf0cfe7c12786394bc20433ecb6d7ff3cf2c4e458dc075c1e56c8666d6a2deb4
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.5.14"
++    version: "2.5.15"
+   sqflite_darwin:
+     dependency: transitive
+     description:
+       name: sqflite_darwin
+-      sha256: "8de68fc306040f992aaf378750c16f95e4298c4bb150dd45091d75e42b1f08ee"
+-      url: "https://pub.dev"
++      sha256: "5652e66a7db9996e8604b70b34b5876714b9dd1257f557041f718a153f995d28"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "2.4.4+1"
++    version: "2.4.5"
+   sqflite_platform_interface:
+     dependency: transitive
+     description:
+       name: sqflite_platform_interface
+       sha256: "5b611dbcb9bab33e7073594ecac111bf0a86ffc342652c2081160d7038a45fb6"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   stack_trace:
+@@ -981,7 +981,7 @@ packages:
+     description:
+       name: stack_trace
+       sha256: "277654b3034d17ac6f9f1cb5595db011b1d5d41e8806866db28e0abaa101c490"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.12.2"
+   state_notifier:
+@@ -989,7 +989,7 @@ packages:
+     description:
+       name: state_notifier
+       sha256: b8677376aa54f2d7c58280d5a007f9e8774f1968d1fb1c096adcb4792fba29bb
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.0.0"
+   stream_channel:
+@@ -997,7 +997,7 @@ packages:
+     description:
+       name: stream_channel
+       sha256: "969e04c80b8bcdf826f8f16579c7b14d780458bd97f56d107d3950fdbeef059d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.1.4"
+   string_scanner:
+@@ -1005,7 +1005,7 @@ packages:
+     description:
+       name: string_scanner
+       sha256: "921cd31725b72fe181906c6a94d987c78e3b98c2e205b397ea399d4054872b43"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.1"
+   sync_http:
+@@ -1013,23 +1013,23 @@ packages:
+     description:
+       name: sync_http
+       sha256: "7f0cd72eca000d2e026bcd6f990b81d0ca06022ef4e32fb257b30d3d1014a961"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.3.1"
+   synchronized:
+     dependency: transitive
+     description:
+       name: synchronized
+-      sha256: b3d516dbd3757ff2a458735e4f6cbac9ff261f576f6e87bcb17feabb39e657c5
+-      url: "https://pub.dev"
++      sha256: "0ce4712bd3be1fccfab14458059baebb400ba6c6239b65398e3464945fabbae7"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "3.5.0"
++    version: "3.6.1"
+   term_glyph:
+     dependency: transitive
+     description:
+       name: term_glyph
+       sha256: "7f554798625ea768a7518313e58f83891c7f5024f88e46e7182a4558850a4b8e"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.2.2"
+   test_api:
+@@ -1037,7 +1037,7 @@ packages:
+     description:
+       name: test_api
+       sha256: "2a122cbe059f8b610d3a5415f42e255b6c17b1f21eee1d960f31080237fb4f11"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.7.12"
+   typed_data:
+@@ -1045,7 +1045,7 @@ packages:
+     description:
+       name: typed_data
+       sha256: f9049c039ebfeb4cf7a7104a675823cd72dba8297f264b6637062516699fa006
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.4.0"
+   universal_platform:
+@@ -1053,7 +1053,7 @@ packages:
+     description:
+       name: universal_platform
+       sha256: "64e16458a0ea9b99260ceb5467a214c1f298d647c659af1bff6d3bf82536b1ec"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   uri_parser:
+@@ -1061,7 +1061,7 @@ packages:
+     description:
+       name: uri_parser
+       sha256: "051c62e5f693de98ca9f130ee707f8916e2266945565926be3ff20659f7853ce"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.0.2"
+   url_launcher:
+@@ -1069,7 +1069,7 @@ packages:
+     description:
+       name: url_launcher
+       sha256: e8cc955c97e06df9879140a1fe301f3d493f01b7c62dec7f46834be31d7e9fda
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.3.3"
+   url_launcher_android:
+@@ -1077,7 +1077,7 @@ packages:
+     description:
+       name: url_launcher_android
+       sha256: "611e87fb320b70d1dd721dc46af89c98aceccea9b31fde49e084591414e0c610"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.3.33"
+   url_launcher_ios:
+@@ -1085,7 +1085,7 @@ packages:
+     description:
+       name: url_launcher_ios
+       sha256: "8faa1aab294f1ab4040b43660c887b0418d5fa4f0cffef76a484e6aa1092eb4a"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "6.4.2"
+   url_launcher_linux:
+@@ -1093,7 +1093,7 @@ packages:
+     description:
+       name: url_launcher_linux
+       sha256: "10f86fef4c2c43563fa6c211ff9cf757adf4d3ab762c56bd430664a947d70cd0"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.3"
+   url_launcher_macos:
+@@ -1101,7 +1101,7 @@ packages:
+     description:
+       name: url_launcher_macos
+       sha256: "5e835a3b869c2d70325349c81c5a45c28e20791265b67b2669da6b08c5cd5201"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.6"
+   url_launcher_platform_interface:
+@@ -1109,7 +1109,7 @@ packages:
+     description:
+       name: url_launcher_platform_interface
+       sha256: "552f8a1e663569be95a8190206a38187b531910283c3e982193e4f2733f01029"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.3.2"
+   url_launcher_web:
+@@ -1117,7 +1117,7 @@ packages:
+     description:
+       name: url_launcher_web
+       sha256: "85c81589622fbc87c1c683aaea164d3604a7777495a79d91e39ffcdec39ddb34"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.3"
+   url_launcher_windows:
+@@ -1125,7 +1125,7 @@ packages:
+     description:
+       name: url_launcher_windows
+       sha256: "6c5ad3f22cd4c38e089b81963b3cd7bb83b111b2df5dce008bb066162f42e429"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.6"
+   uuid:
+@@ -1133,23 +1133,23 @@ packages:
+     description:
+       name: uuid
+       sha256: "9b129329f58692f6e6578329498a8fe9fbe98f090beb764ffbb8ee2eadd01dcd"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "4.6.0"
+   vector_graphics:
+     dependency: transitive
+     description:
+       name: vector_graphics
+-      sha256: "4e5f106dfc6f0e4e7efe11603e38c34352d912905320b930128a9b1ad61363f4"
+-      url: "https://pub.dev"
++      sha256: "82885f6ac633044e7a4e4d8d745724a67aa0dc50af5d8a81ec29379f63c29035"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+-    version: "1.2.5"
++    version: "1.2.6"
+   vector_graphics_codec:
+     dependency: transitive
+     description:
+       name: vector_graphics_codec
+       sha256: "99fd9fbd34d9f9a32efd7b6a6aae14125d8237b10403b422a6a6dfeac2806146"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.13"
+   vector_graphics_compiler:
+@@ -1157,7 +1157,7 @@ packages:
+     description:
+       name: vector_graphics_compiler
+       sha256: "4c9d2e7121eea8b4f160e6e435900a0ae7214cfc97c2d6cf84c25532b789b50d"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.3.4"
+   vector_math:
+@@ -1165,7 +1165,7 @@ packages:
+     description:
+       name: vector_math
+       sha256: fa49e1674cb84acb900141714e6c6e1f9ae099827c24d141430ff6819db4e1bc
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "2.4.4"
+   vm_service:
+@@ -1173,7 +1173,7 @@ packages:
+     description:
+       name: vm_service
+       sha256: "89b11d62e1040ee681af3b4f1c97a803ecbf010c6e8b9c5896ee5b08c3bf7b78"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "15.4.0"
+   wakelock_plus:
+@@ -1181,7 +1181,7 @@ packages:
+     description:
+       name: wakelock_plus
+       sha256: ddf3db70eaa10c37558ff817519b85d527dbd21034fd5d8e1c2e85f31588f1c1
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.5.2"
+   wakelock_plus_platform_interface:
+@@ -1189,7 +1189,7 @@ packages:
+     description:
+       name: wakelock_plus_platform_interface
+       sha256: "764c25504562abc8ac3406f5d175f126b276e6ba916c7c2675690b73368ca384"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.7.0"
+   web:
+@@ -1197,7 +1197,7 @@ packages:
+     description:
+       name: web
+       sha256: e119e82ac4795c7925103b7cf3768191f33941b99e7ccffbd6c645201d9f606b
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.2"
+   webdriver:
+@@ -1205,7 +1205,7 @@ packages:
+     description:
+       name: webdriver
+       sha256: "28b82ec894fed45dd71c23ba62d1af973ed97dd59a4f5790a4d38b0b13e5657e"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.2.0"
+   webview_windows:
+@@ -1220,7 +1220,7 @@ packages:
+     description:
+       name: win32
+       sha256: d7cb55e04cd34096cd3a79b3330245f54cb96a370a1c27adb3c84b917de8b08e
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "5.15.0"
+   window_manager:
+@@ -1228,7 +1228,7 @@ packages:
+     description:
+       name: window_manager
+       sha256: "05c231fd7b23d2380f14c5cc10b7b93d60d4fa4a2fb4e0f032de27e44b5560e9"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "0.5.2"
+   xdg_directories:
+@@ -1236,7 +1236,7 @@ packages:
+     description:
+       name: xdg_directories
+       sha256: "7a3f37b05d989967cdddcbb571f1ea834867ae2faa29725fd085180e0883aa15"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "1.1.0"
+   xml:
+@@ -1244,7 +1244,7 @@ packages:
+     description:
+       name: xml
+       sha256: "67f0aff7be013d107995e9b75bf4e7f2c3ef2dfdb2c8e68024bba0a7fd5756a4"
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "7.0.1"
+   yaml:
+@@ -1252,7 +1252,7 @@ packages:
+     description:
+       name: yaml
+       sha256: f67cdd8e07d3c6329146aaef1ba043542b3134c12489f553ca9a7435d1068aea
+-      url: "https://pub.dev"
++      url: "https://pub.flutter-io.cn"
+     source: hosted
+     version: "3.1.4"
+ sdks:
+diff --git a/test/about_page_test.dart b/test/about_page_test.dart
+index 2990a0c..07f888d 100644
+--- a/test/about_page_test.dart
++++ b/test/about_page_test.dart
+@@ -41,13 +41,27 @@ void main() {
+     expect(find.text('Source Code'), findsNothing);
+     expect(find.text('源代码'), findsOneWidget);
+     expect(find.text('问题反馈'), findsOneWidget);
++    expect(find.text('手表适配反馈'), findsOneWidget);
++    expect(find.text(AboutPage.adaptationFeedbackEmail), findsOneWidget);
+     // 信息行统一走设置组件，不再使用 Material ListTile。
+-    expect(find.byType(SettingsRow), findsNWidgets(5));
++    expect(find.byType(SettingsRow), findsNWidgets(6));
+     expect(find.byType(ListTile), findsNothing);
+ 
+-    expect(find.text('支持作者'), findsOneWidget);
++    expect(find.text('支持原作者'), findsOneWidget);
++    // 二次分发版必须写清赞赏归属，不能被读成适配者在收款。
++    expect(
++      find.textContaining('赞赏渠道归原作者 ch6vip 所有'),
++      findsOneWidget,
++    );
++    expect(find.textContaining('手表端适配者不收取任何费用'), findsOneWidget);
+     expect(find.text('前往爱发电'), findsOneWidget);
+     expect(find.text('微信赞赏'), findsOneWidget);
++    // 二次分发署名：注明适配者与上游版本，与原作者赞赏卡分开。
++    expect(
++      find.textContaining('手表端适配与优化：寒彻歌未竟'),
++      findsOneWidget,
++    );
++    expect(find.textContaining('基于 fqapp 1.0.200'), findsOneWidget);
+     expect(find.textContaining('仅限个人学习研究使用'), findsOneWidget);
+   });
+ 
+@@ -77,6 +91,41 @@ void main() {
+     expect(find.text('已复制版本号'), findsOneWidget);
+   });
+ 
++  testWidgets('手表适配反馈可复制邮箱，且与上游反馈分开', (tester) async {
++    String? copied;
++    tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
++      SystemChannels.platform,
++      (call) async {
++        if (call.method == 'Clipboard.setData') {
++          copied = (call.arguments as Map)['text'] as String?;
++        }
++        return null;
++      },
++    );
++    addTearDown(
++      () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
++        SystemChannels.platform,
++        null,
++      ),
++    );
++
++    await pumpAbout(tester);
++    await tester.tap(find.text('手表适配反馈'));
++    await tester.pumpAndSettle();
++
++    expect(find.byType(AlertDialog), findsOneWidget);
++    expect(find.text(AboutPage.adaptationFeedbackEmail), findsWidgets);
++    expect(
++      find.textContaining('原项目本身的问题请走上方'),
++      findsOneWidget,
++    );
++
++    await tester.tap(find.text('复制邮箱'));
++    await tester.pumpAndSettle();
++    expect(copied, AboutPage.adaptationFeedbackEmail);
++    expect(find.text('已复制反馈邮箱'), findsOneWidget);
++  });
++
+   testWidgets('点开源许可打开许可页', (tester) async {
+     await pumpAbout(tester);
+     await tester.tap(find.text('开源许可'));
+@@ -99,7 +148,7 @@ void main() {
+     await tester.pumpAndSettle();
+ 
+     expect(find.byType(Dialog), findsOneWidget);
+-    expect(find.text('微信扫一扫，赞赏作者'), findsOneWidget);
++    expect(find.text('微信扫一扫，赞赏原作者 ch6vip'), findsOneWidget);
+     final image = tester.widget<Image>(find.byType(Image).last);
+     expect(
+       (image.image as AssetImage).assetName,
+diff --git a/test/audio_page_test.dart b/test/audio_page_test.dart
+index ef75c52..3e4cd0e 100644
+--- a/test/audio_page_test.dart
++++ b/test/audio_page_test.dart
+@@ -649,6 +649,68 @@ void main() {
+     expect(session.players.last.rate, 1.5);
+   });
+ 
++  testWidgets('watch narrow screen warns above 2.0x speed', (tester) async {
++    final session = _Session();
++    await _mount(tester, session);
++    // setSurfaceSize 在这个 Flutter 版本里不改 tester.view，显式设成
++    // 320×700 逻辑(dp) < compactShellDockBreakpoint(340) 才会走手表分支。
++    tester.view
++      ..devicePixelRatio = 1.0
++      ..physicalSize = const Size(320, 700);
++    addTearDown(tester.view.reset);
++    await tester.pump();
++    await tester.ensureVisible(find.byKey(const ValueKey('audio-speed')));
++    await tester.tap(find.byKey(const ValueKey('audio-speed')));
++    await tester.pumpAndSettle();
++    expect(find.text('超过 2.0× 在手表上可能卡顿'), findsNothing);
++
++    final slider = tester.widget<Slider>(
++      find.byKey(const ValueKey('audio-speed-slider')),
++    );
++    slider.onChanged!(2.5);
++    await _flush(tester);
++    await tester.pumpAndSettle();
++    expect(find.text('超过 2.0× 在手表上可能卡顿'), findsOneWidget);
++
++    tester
++        .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
++        .onChanged!(2.0);
++    await _flush(tester);
++    await tester.pumpAndSettle();
++    expect(find.text('超过 2.0× 在手表上可能卡顿'), findsNothing);
++
++    // 关掉面板时按最终值轻提醒一次（会话内只弹一次）。
++    tester
++        .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
++        .onChanged!(2.5);
++    await _flush(tester);
++    await tester.pumpAndSettle();
++    // 这个假 app 没有 BackButton，直接 pop 掉 bottom sheet 这条 route。
++    Navigator.of(
++      tester.element(find.byKey(const ValueKey('audio-speed-slider'))),
++    ).pop();
++    await tester.pump();
++    await tester.pump(const Duration(milliseconds: 100));
++    expect(
++      find.text('高倍速在手表上可能卡顿，建议不超过 2.0×'),
++      findsOneWidget,
++    );
++  });
++
++  testWidgets('wide screen does not show the watch speed warning', (tester) async {
++    final session = _Session();
++    await _mount(tester, session);
++    await tester.ensureVisible(find.byKey(const ValueKey('audio-speed')));
++    await tester.tap(find.byKey(const ValueKey('audio-speed')));
++    await tester.pumpAndSettle();
++    tester
++        .widget<Slider>(find.byKey(const ValueKey('audio-speed-slider')))
++        .onChanged!(3.0);
++    await _flush(tester);
++    await tester.pumpAndSettle();
++    expect(find.text('超过 2.0× 在手表上可能卡顿'), findsNothing);
++  });
++
+   testWidgets(
+     'only the newest chapter plays when earlier requests finish late',
+     (tester) async {
